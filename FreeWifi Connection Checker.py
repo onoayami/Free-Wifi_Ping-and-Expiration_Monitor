@@ -405,7 +405,7 @@ class WiFiMonitorApp(rumps.App):
         current_text = current if current else "取得できませんでした"
 
         message = (
-            "ここに登録したWi-Fiでは接続タイマー・通知が動作しません。\n\n"
+            "以下に登録したWi-Fiでは\n接続タイマー・通知が作動しません。\n\n自宅や職場のWi-Fiを登録しておくのがおすすめです。\n\n"
             "＝＝＝ 登録済みリスト ＝＝＝\n"
             f"{list_text}\n\n"
             "――――――――――――\n"
@@ -498,39 +498,28 @@ class WiFiMonitorApp(rumps.App):
         self.update_display(None)
         rumps.notification("Wi-Fi Monitor", "解除完了", f"{removed_count} 件のWi-Fiを非通知リストから解除しました。")
 
-    @rumps.clicked("⏱️ 表示切替 (接続時間 ⇆ Ping)")
-    def toggle_display_mode(self, _):
-        """ タイマー表示とPing速度表示を切り替える """
-        if self.display_mode == "timer":
-            self.display_mode = "ping"
-        else:
-            self.display_mode = "timer"
-            
-            # Pingから接続時間表示に戻したときにポップアップで確認
-            response = rumps.alert(
-                title="Wi-Fi時間通知を行います",
-                message="",
-                ok="OK（続行）",
-                cancel="通知しない"
-            )
-            
-            # responseは 0 (cancel) または 1 (ok) で返る
-            if response == 0:
-                self.suppress_notif = True
-            else:
-                self.suppress_notif = False
-                
-        self.check_network(None)  # Ping状態を即時取得
-        self.update_display(None) # 表示を即時更新
+    @rumps.clicked("⚙️ タイマーの設定")
+    def manage_timer_settings(self, _):
+        """ タイマー設定の分岐用UI """
+        response = rumps.alert(
+            title="⚙️ タイマーの設定",
+            message="実行する操作を選択してください。",
+            ok="通知時間の設定",
+            cancel="キャンセル",
+            other="時間カウントをリセットする"
+        )
+        if response == 1:
+            self._open_timer_settings()
+        elif response == -1:
+            self._reset_timer()
 
-    @rumps.clicked("🔄 タイマーをリセット (0分から)")
-    def reset_timer(self, _):
-        """ カウントを現在時刻から0分としてリセットする """
+    def _reset_timer(self):
+        """ カウントを現在時刻から0分にリセットする """
         if self.is_online:
             # リセット前に確認のポップアップを出す
             response = rumps.alert(
                 title="タイマーのリセット",
-                message="本当に接続タイマーを0分からリセットしますか？",
+                message="接続タイマーを0分にリセットしますか？",
                 ok="リセットする",
                 cancel="キャンセル"
             )
@@ -540,19 +529,18 @@ class WiFiMonitorApp(rumps.App):
                 self.connected_time = datetime.now()
                 self.notified_targets.clear()
                 self.update_display(None)
-                rumps.notification("Wi-Fi Monitor", "タイマーをリセットしました", "0分からカウントを再開します")
+                rumps.notification("Wi-Fi Monitor", "タイマーをリセットしました", "カウントを0分にリセットしました")
         else:
             rumps.alert("エラー", "Wi-Fiに接続されていないためリセットできません。")
 
-    @rumps.clicked("⚙️ タイマーの設定について")
-    def open_timer_settings(self, _):
+    def _open_timer_settings(self):
         """ タイマーの時間を変更するポップアップウィンドウを表示 """
         # 現在の設定をカンマ区切りで表示準備
         current_setting_str = ", ".join(map(str, self.target_minutes)) if self.target_minutes else "0"
         
         window = rumps.Window(
             title="通知タイマーの設定",
-            message="何分後に通知を出しますか？\n複数設定する場合はカンマで区切ってください（例: 50, 55）\n※ 0 を入力すると通知をオフにできます。",
+            message="接続開始から何分後に通知を出しますか？\n複数設定する場合はカンマで区切ってください（例: 50, 55）\n※ 0 を入力すると通知をオフにできます。",
             default_text=current_setting_str,
             dimensions=(200, 20),
             ok="設定する",
@@ -612,46 +600,34 @@ class WiFiMonitorApp(rumps.App):
         if isinstance(data, dict):
             action = data.get("action")
             if action == "open_timer_setting":
-                self.open_timer_settings(None)
+                self._open_timer_settings()
             elif action == "open_wifi_from_alert":
                 self.open_wifi_settings(None)
 
-    @rumps.clicked("👀 現在のSSIDを確認")
-    def show_current_ssid(self, _):
-        """ 現在接続中のSSIDをポップアップで表示し、コピーする機能 """
-        current = getattr(self, "current_ssid", None)
-        # キャッシュが無い、または伏せ字だった場合は取得し直す
-        if not current or "redacted" in str(current).lower():
-            current = self.get_current_ssid()
-            
-        if current:
-            if "redacted" in current.lower():
-                response = rumps.alert(
-                    title="⚠️ SSID取得エラー (macOS制限)",
-                    message=("macOSのプライバシー保護機能により、SSIDが隠されています（取得結果が[redacted]になっています）。\n\n"
-                             "▼ 対処法\n"
-                             "「システム設定」>「プライバシーとセキュリティ」>「位置情報サービス」から、実行中のアプリ（ターミナルやVS Codeなど）をオンにして再起動してください。\n\n"
-                             "▼ VPNについて\n"
-                             "VPNはSSIDの伏せ字とは直接関係しません（SSID取得はWi-Fi層、VPNはその上の通信層のため）。ただしVPN接続中は、フリーWi-Fiの接続判定（captive.apple.com への到達確認）が実際と異なる結果になる場合があります。SSIDが取得できないときはVPNではなく位置情報の許可をご確認ください。"),
-                    ok="位置情報サービスの設定を開く",
-                    cancel="閉じる"
-                )
-                if response == 1:
-                    # macOSの位置情報サービス設定を開く
-                    subprocess.run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"])
-            else:
-                message = f"現在接続中のWi-Fi SSID:\n\n【 {current} 】"
-                response = rumps.alert(
-                    title="📶 SSID情報",
-                    message=message,
-                    ok="コピペする",
-                    cancel="閉じる"
-                )
-                if response == 1:
-                    subprocess.run("pbcopy", text=True, input=current)
-                    rumps.notification("Wi-Fi Monitor", "コピー完了", f"「{current}」をクリップボードにコピーしました！")
+    @rumps.clicked("⏱️ 表示切替 (接続時間 ⇆ Ping)")
+    def toggle_display_mode(self, _):
+        """ タイマー表示とPing速度表示を切り替える """
+        if self.display_mode == "timer":
+            self.display_mode = "ping"
         else:
-            rumps.alert("📶 SSID情報", "現在Wi-Fiに接続されていないか、SSIDを取得できません。")
+            self.display_mode = "timer"
+            
+            # Pingから接続時間表示に戻したときにポップアップで確認
+            response = rumps.alert(
+                title="Wi-Fi時間通知を行います",
+                message="",
+                ok="OK（続行）",
+                cancel="通知しない"
+            )
+            
+            # responseは 0 (cancel) または 1 (ok) で返る
+            if response == 0:
+                self.suppress_notif = True
+            else:
+                self.suppress_notif = False
+                
+        self.check_network(None)  # Ping状態を即時取得
+        self.update_display(None) # 表示を即時更新
 
     @rumps.clicked("🛜 Wi-Fi設定を開く")
     def open_wifi_settings(self, _):
