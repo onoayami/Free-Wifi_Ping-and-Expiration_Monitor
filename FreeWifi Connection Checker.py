@@ -26,7 +26,7 @@ class WiFiMonitorApp(rumps.App):
         self.cached_ping_display = "" # Ping表示のキャッシュ
         # 連続で何回チェックに失敗したらオフライン確定とするか（瞬断の誤判定を防ぐ）
         self.failure_count = 0
-        self.offline_threshold = 2  # 2回連続失敗（=約20秒）で初めてオフライン扱い
+        self.offline_threshold = 4  # 4回連続失敗（=約20秒）で初めてオフライン扱い
         self.target_minutes = [50, 55] # 設定された通知時間（複数可、デフォルト50分と55分）
         self.disconnected_time = None # オフラインになった時刻を記録
         
@@ -183,7 +183,7 @@ class WiFiMonitorApp(rumps.App):
         except Exception:
             return "🔴 Error"
 
-    @rumps.timer(10) # 10秒ごとに通信チェック
+    @rumps.timer(5) # 5秒ごとに通信チェック
     def check_network(self, _):
         now = datetime.now()
         
@@ -230,7 +230,7 @@ class WiFiMonitorApp(rumps.App):
                 
                 if is_safe:
                     self.target_minutes = []
-                    self.connected_time = now
+                    self.connected_time = now - timedelta(seconds=20)
                     self.notified_targets.clear()
                     self.display_mode = "ping"  # 非通知Wi-Fiの場合は自動でPing表示にする
                     rumps.notification(
@@ -248,7 +248,7 @@ class WiFiMonitorApp(rumps.App):
                 else:
                     # 新規接続・ネットワーク変更・5分以上経過 → リセットして通知設定ポップアップを出す
                     self.display_mode = "timer" # 通常のWi-Fiの場合はタイマー表示に戻す
-                    self.connected_time = now - timedelta(seconds=10)
+                    self.connected_time = now - timedelta(seconds=20)
                     self.notified_targets.clear()
                     
                     if was_sleeping and not ssid_changed:
@@ -259,6 +259,12 @@ class WiFiMonitorApp(rumps.App):
                             message=f"接続開始: {time_str} 〜 タイマーをリセットしました"
                         )
                     else:
+                        rumps.notification(
+                            title="Wi-Fi Monitor",
+                            subtitle="フリーWifiタイマーを起動しました",
+                            message=f"接続先: {getattr(self, 'current_ssid', '不明')}"
+                        )
+                        
                         # ポップアップを非同期で表示する関数
                         def prompt_timer_setup():
                             ssid_disp = getattr(self, "current_ssid", None) or "新しいネットワーク"
@@ -336,15 +342,9 @@ class WiFiMonitorApp(rumps.App):
 
             # 目標時間以上経過している場合は警告表示（タイマー表示時のみ）、それ以外は通常表示
             active_targets = sorted([m for m in self.target_minutes if m > 0])
-            min_target = active_targets[0] if active_targets else None
             
             if getattr(self, "is_safe_wifi", False):
-                ssid_disp = getattr(self, "current_ssid", "Safe") or "Safe"
-                if len(ssid_disp) > 10:
-                    ssid_disp = ssid_disp[:9] + "…"
-                self.title = f"🏠 {ssid_disp}" if self.display_mode == "timer" else self.cached_ping_display
-            elif min_target and elapsed_minutes >= min_target:
-                self.title = f"⚠️ {time_str}" if self.display_mode == "timer" else self.cached_ping_display
+                self.title = f"🏠 {time_str}" if self.display_mode == "timer" else self.cached_ping_display
             else:
                 self.title = f"🌐 {time_str}" if self.display_mode == "timer" else self.cached_ping_display
                 
@@ -439,6 +439,7 @@ class WiFiMonitorApp(rumps.App):
             self.save_safe_ssids()
             self.is_safe_wifi = True
             self.target_minutes = []
+            self.display_mode = "ping"  # 登録時に自動でPing表示に切り替える
             self.update_display(None)
             rumps.alert("登録完了", f"「{self.current_ssid}」を非通知リストに登録しました。\n以降このネットワークではタイマーは起動しません。")
         else:
@@ -538,9 +539,15 @@ class WiFiMonitorApp(rumps.App):
         # 現在の設定をカンマ区切りで表示準備
         current_setting_str = ", ".join(map(str, self.target_minutes)) if self.target_minutes else "0"
         
+        # 現在のステータスをテキスト化
+        if self.target_minutes:
+            current_display = f"【現在の設定: {current_setting_str} 分後】"
+        else:
+            current_display = "【現在の設定: オフ(通知しない)】"
+        
         window = rumps.Window(
             title="通知タイマーの設定",
-            message="接続開始から何分後に通知を出しますか？\n複数設定する場合はカンマで区切ってください（例: 50, 55）\n※ 0 を入力すると通知をオフにできます。",
+            message=f"{current_display}\n\n接続開始から何分後に通知を出しますか？\n複数設定する場合はカンマで区切ってください（例: 50, 55）\n※ 0 を入力すると通知をオフにできます。",
             default_text=current_setting_str,
             dimensions=(200, 20),
             ok="設定する",
