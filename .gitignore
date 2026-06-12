@@ -11,3 +11,8 @@ __pycache__/
 
 # Mac OS
 .DS_Store
+
+# Test and unneeded files
+test_*.py
+fix_order.py
+
