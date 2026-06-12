@@ -17,7 +17,7 @@ info['CFBundleIdentifier'] = 'com.python.wifimonitor'
 class WiFiMonitorApp(rumps.App):
     def __init__(self):
         # 最初はオフライン状態として起動
-        super(WiFiMonitorApp, self).__init__("🔴")
+        super(WiFiMonitorApp, self).__init__("🌀")
         self.is_online = False
         self.connected_time = None
         self.notified_targets = set() # 通知済みの目標時間を記録するセット
@@ -84,9 +84,30 @@ class WiFiMonitorApp(rumps.App):
 
     def get_current_ssid(self):
         """ 接続中Wi-FiのSSIDを取得する。
-        macOS 14.4以降では networksetup -getairportnetwork が位置情報権限なしでは
-        SSIDを返さないため、ipconfig getsummary を主手段として用いる。 """
+        macOS 14.4以降では ipconfig/networksetup が位置情報権限なしでは伏せ字(<redacted>)を
+        返すため、権限不要で実値が得られる system_profiler を確実なフォールバックとして用いる。 """
         device = self.get_wifi_device()
+
+        # 取得結果が伏せ字(redacted)や無効値でないか判定するヘルパー
+        def _valid(s):
+            if not s:
+                return False
+            low = s.strip().lower()
+            if "redacted" in low or low in ("", "you are not associated with an airport network."):
+                return False
+            return True
+
+        # 最優先手段: CoreWLAN (Appleの公式フレームワーク)。位置情報の許可がある環境では即座に取得できる。
+        try:
+            import CoreWLAN
+            client = CoreWLAN.CWWiFiClient.sharedWiFiClient()
+            interface = client.interface()
+            if interface is not None:
+                ssid = interface.ssid()
+                if _valid(ssid):
+                    return str(ssid)
+        except Exception:
+            pass
 
         # 主手段: ipconfig getsummary <device> の出力からSSID行を抽出
         try:
@@ -94,19 +115,28 @@ class WiFiMonitorApp(rumps.App):
             if result.returncode == 0:
                 # 行頭の空白を許容しつつ、BSSIDではなくSSID行のみにマッチさせる
                 m = re.search(r"^\s*SSID\s*:\s*(.+?)\s*$", result.stdout, re.MULTILINE)
-                if m:
-                    ssid = m.group(1).strip()
-                    if ssid:
-                        return ssid
+                if m and _valid(m.group(1)):
+                    return m.group(1).strip()
         except Exception:
             pass
 
-        # フォールバック: 旧来の networksetup（位置情報権限がある環境では機能する）
+        # 確実なフォールバック: system_profiler は位置情報の許可が無くても実SSIDを返す（やや低速）。
+        # "Current Network Information:" の次行にSSID名（末尾コロン付き）が出力される。
+        try:
+            result = subprocess.run(["system_profiler", "SPAirPortDataType"], capture_output=True, text=True, timeout=8)
+            if result.returncode == 0:
+                m = re.search(r"Current Network Information:\s*\n\s*(.+?):\s*\n", result.stdout)
+                if m and _valid(m.group(1)):
+                    return m.group(1).strip()
+        except Exception:
+            pass
+
+        # 最後のフォールバック: 旧来の networksetup（位置情報権限がある環境では機能する）
         try:
             result = subprocess.run(["networksetup", "-getairportnetwork", device], capture_output=True, text=True, timeout=3)
             if result.returncode == 0 and "Current Wi-Fi Network:" in result.stdout:
                 ssid = result.stdout.split("Current Wi-Fi Network:")[1].strip()
-                if ssid:
+                if _valid(ssid):
                     return ssid
         except Exception:
             pass
@@ -202,6 +232,7 @@ class WiFiMonitorApp(rumps.App):
                     self.target_minutes = []
                     self.connected_time = now
                     self.notified_targets.clear()
+                    self.display_mode = "ping"  # 非通知Wi-Fiの場合は自動でPing表示にする
                     rumps.notification(
                         title="Wi-Fi Monitor",
                         subtitle=f"🏠 安全なWi-Fiに接続: {self.current_ssid}",
@@ -216,6 +247,7 @@ class WiFiMonitorApp(rumps.App):
                     )
                 else:
                     # 新規接続・ネットワーク変更・5分以上経過 → リセットして通知設定ポップアップを出す
+                    self.display_mode = "timer" # 通常のWi-Fiの場合はタイマー表示に戻す
                     self.connected_time = now - timedelta(seconds=10)
                     self.notified_targets.clear()
                     
@@ -358,7 +390,7 @@ class WiFiMonitorApp(rumps.App):
                 
             self.title = "🔴" if self.display_mode == "timer" else "🔴 オフライン"
 
-    @rumps.clicked("🏠 非通知wifiリスト")
+    @rumps.clicked("🏠 タイマー非通知wifi設定")
     def manage_safe_wifi(self, _):
         """ 非通知（タイマー対象外）Wi-Fiの一覧表示・登録・解除をまとめて行うポップアップ """
         safe_list = getattr(self, "safe_ssids", []) or []
@@ -366,9 +398,9 @@ class WiFiMonitorApp(rumps.App):
 
         # 登録済みリストを1行ずつ見やすく整形
         if safe_list:
-            list_text = "\n".join(f"　•　{ssid}" for ssid in safe_list)
+            list_text = "\n".join(safe_list)
         else:
-            list_text = "　（まだ登録されていません）"
+            list_text = "（まだ登録されていません）"
 
         current_text = current if current else "取得できませんでした"
 
@@ -382,17 +414,17 @@ class WiFiMonitorApp(rumps.App):
 
         # ok=登録 / other=解除 / cancel=閉じる の3ボタン
         response = rumps.alert(
-            title="🏠 非通知wifiリスト",
+            title="🏠 タイマー非通知wifiリスト",
             message=message,
-            ok="現在のWi-Fiを登録",
+            ok="現在のWi-Fiを非通知リストに登録",
             cancel="閉じる",
-            other="登録を解除…"
+            other="過去のものから選んで削除"
         )
 
         if response == 1:
             # 現在のWi-Fiを登録
             self._register_current_safe_wifi()
-        elif response == 2:
+        elif response == -1:
             # 登録を解除（どのWi-Fiを解除するか選ばせる）
             self._unregister_safe_wifi()
 
@@ -583,6 +615,43 @@ class WiFiMonitorApp(rumps.App):
                 self.open_timer_settings(None)
             elif action == "open_wifi_from_alert":
                 self.open_wifi_settings(None)
+
+    @rumps.clicked("👀 現在のSSIDを確認")
+    def show_current_ssid(self, _):
+        """ 現在接続中のSSIDをポップアップで表示し、コピーする機能 """
+        current = getattr(self, "current_ssid", None)
+        # キャッシュが無い、または伏せ字だった場合は取得し直す
+        if not current or "redacted" in str(current).lower():
+            current = self.get_current_ssid()
+            
+        if current:
+            if "redacted" in current.lower():
+                response = rumps.alert(
+                    title="⚠️ SSID取得エラー (macOS制限)",
+                    message=("macOSのプライバシー保護機能により、SSIDが隠されています（取得結果が[redacted]になっています）。\n\n"
+                             "▼ 対処法\n"
+                             "「システム設定」>「プライバシーとセキュリティ」>「位置情報サービス」から、実行中のアプリ（ターミナルやVS Codeなど）をオンにして再起動してください。\n\n"
+                             "▼ VPNについて\n"
+                             "VPNはSSIDの伏せ字とは直接関係しません（SSID取得はWi-Fi層、VPNはその上の通信層のため）。ただしVPN接続中は、フリーWi-Fiの接続判定（captive.apple.com への到達確認）が実際と異なる結果になる場合があります。SSIDが取得できないときはVPNではなく位置情報の許可をご確認ください。"),
+                    ok="位置情報サービスの設定を開く",
+                    cancel="閉じる"
+                )
+                if response == 1:
+                    # macOSの位置情報サービス設定を開く
+                    subprocess.run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"])
+            else:
+                message = f"現在接続中のWi-Fi SSID:\n\n【 {current} 】"
+                response = rumps.alert(
+                    title="📶 SSID情報",
+                    message=message,
+                    ok="コピペする",
+                    cancel="閉じる"
+                )
+                if response == 1:
+                    subprocess.run("pbcopy", text=True, input=current)
+                    rumps.notification("Wi-Fi Monitor", "コピー完了", f"「{current}」をクリップボードにコピーしました！")
+        else:
+            rumps.alert("📶 SSID情報", "現在Wi-Fiに接続されていないか、SSIDを取得できません。")
 
     @rumps.clicked("🛜 Wi-Fi設定を開く")
     def open_wifi_settings(self, _):
