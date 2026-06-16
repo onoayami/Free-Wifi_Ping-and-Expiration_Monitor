@@ -1,12 +1,16 @@
 import rumps
 import urllib.request
 from datetime import datetime, timedelta
-import AppKit
+from typing import Any, cast
+import AppKit as _AppKit
 import subprocess
 import json
 import os
 import re
 import threading
+
+# PyObjCの動的属性(NSAlert等)を型チェッカーが認識できず誤検知を出すため、Any扱いにする
+AppKit = cast(Any, _AppKit)
 
 # Macの下のDock（メニューバー）に実行中のPythonアイコンを表示しないための設定
 info = AppKit.NSBundle.mainBundle().infoDictionary()  # type: ignore[attr-defined]
@@ -275,15 +279,15 @@ class WiFiMonitorApp(rumps.App):
             else:
                 current_status = False
 
-        new_ssid = getattr(self, "get_current_ssid", lambda: None)()
-        ssid_changed = getattr(self, "current_ssid", None) is not None and new_ssid is not None and getattr(self, "current_ssid", None) != new_ssid
-        
         if self.display_mode == "ping" and current_status:
             self.cached_ping_display = self.get_ping_status()
         else:
             self.cached_ping_display = ""
 
         if current_status:
+            # SSIDの取得はオンライン時のみ行う（オフライン時は未使用のため省略して負荷を下げる）
+            new_ssid = self.get_current_ssid()
+            ssid_changed = self.current_ssid is not None and new_ssid is not None and self.current_ssid != new_ssid
             # 【オフライン -> オンライン】に切り替わった瞬間 または SSIDが変わった瞬間
             if not getattr(self, "is_online", False) or ssid_changed:
                 self.is_online = True
@@ -413,18 +417,20 @@ class WiFiMonitorApp(rumps.App):
 
         # カスタムタイマーの有効状態を先に確認（表示制御に使用）
         _custom_timer_active = (
-            getattr(self, "custom_timer_end_time", None) is not None
+            self.custom_timer_end_time is not None
             and not getattr(self, "is_custom_timer_alert_showing", False)
             and (self.custom_timer_end_time - datetime.now()).total_seconds() > 0
         )
         # タイマーが無効になっていて表示モードが "custom_timer" なら "timer" に戻す
         if not _custom_timer_active and self.display_mode == "custom_timer":
             self.display_mode = "timer"
-        # カスタムタイマーのメニュー項目を表示・非表示
-        self.countdown_display_menu._menuitem.setHidden_(not _custom_timer_active)
+        # カスタムタイマーのメニュー項目を表示・非表示（状態が変化した時のみObjC呼び出し）
+        if getattr(self, "_last_countdown_hidden", None) != (not _custom_timer_active):
+            self._last_countdown_hidden = not _custom_timer_active
+            self.countdown_display_menu._menuitem.setHidden_(not _custom_timer_active)
         # タイマー残り時間の計算（バー表示に使用）
         _custom_rem_str = ""
-        if _custom_timer_active:
+        if _custom_timer_active and self.custom_timer_end_time is not None:
             _rem = (self.custom_timer_end_time - datetime.now()).total_seconds()
             _custom_rem_str = f"⏱️ {int(_rem // 60):02d}:{int(_rem % 60):02d}"
 
@@ -456,7 +462,7 @@ class WiFiMonitorApp(rumps.App):
         # カスタムタイマーの処理
         if getattr(self, "is_custom_timer_alert_showing", False):
             pass  # アラート表示中はメニューの更新をスキップ
-        elif getattr(self, "custom_timer_end_time", None):
+        elif self.custom_timer_end_time is not None:
             now = datetime.now()
             remaining = self.custom_timer_end_time - now
             if remaining.total_seconds() > 0:
@@ -923,7 +929,7 @@ class WiFiMonitorApp(rumps.App):
         """ 「タイマーの設定」メニュー: 独立したタイマー機能として動作 """
         # タイマーが起動中の場合は再設定ポップアップを表示
         _timer_active = (
-            getattr(self, "custom_timer_end_time", None) is not None
+            self.custom_timer_end_time is not None
             and not getattr(self, "is_custom_timer_alert_showing", False)
             and (self.custom_timer_end_time - datetime.now()).total_seconds() > 0
         )
