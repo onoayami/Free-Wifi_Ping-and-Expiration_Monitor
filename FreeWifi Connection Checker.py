@@ -9,7 +9,7 @@ import re
 import threading
 
 # Macの下のDock（メニューバー）に実行中のPythonアイコンを表示しないための設定
-info = AppKit.NSBundle.mainBundle().infoDictionary()
+info = AppKit.NSBundle.mainBundle().infoDictionary()  # type: ignore[attr-defined]
 info['LSUIElement'] = '1'
 # macOSに通知を許可させるためのダミーのアプリ識別子（Bundle ID）を設定
 info['CFBundleIdentifier'] = 'com.python.wifimonitor'
@@ -19,6 +19,7 @@ class WiFiMonitorApp(rumps.App):
         # 最初はオフライン状態として起動
         super(WiFiMonitorApp, self).__init__("🌀")
         self.is_online = False
+        self.first_check_done = False # 初回チェックが完了したかどうかのフラグ
         self.connected_time = None
         self.notified_targets = set() # 通知済みの目標時間を記録するセット
         self.display_mode = "timer"  # 表示モード: "timer" (時間表示) または "ping" (応答速度)
@@ -28,7 +29,14 @@ class WiFiMonitorApp(rumps.App):
         self.failure_count = 0
         self.offline_threshold = 4  # 4回連続失敗（=約20秒）で初めてオフライン扱い
         self.target_minutes = [50, 55] # 設定された通知時間（複数可、デフォルト50分と55分）
+        self.previous_target_minutes = [50, 55] # ON/OFF切り替え時に復元するための保存用
         self.disconnected_time = None # オフラインになった時刻を記録
+        
+        # --- カスタムタイマー用 ---
+        self.custom_timer_end_time = None
+        self.custom_timer_name = ""
+        self.custom_timer_duration_minutes = 0
+        self.is_custom_timer_alert_showing = False
         
         # --- 安全なWi-Fi (自宅など) の設定保持 ---
         self.config_path = os.path.expanduser("~/.wifimonitor_safe_ssids.json")
@@ -40,28 +48,45 @@ class WiFiMonitorApp(rumps.App):
         self.last_heartbeat = datetime.now()
 
         # --- メニューを望む順序で再構築 ---
-        # 各メニュー項目をタイトルキーで取得しておく
-        _item_wifi   = self.menu.get("🛜 Wi-Fi設定を開く")
-        _item_safe   = self.menu.get("🏠 アラーム非通知wifiの設定")
-        _item_timer  = self.menu.get("⏰ アラームの設定")
-        _item_toggle = self.menu.get("📶 表示切替 (接続時間 ⇆ Ping)")
-
         self.menu.clear()
 
-        # 1. SSID表示（クリックでWi-Fi設定を開く）
-        self.ssid_menu = rumps.MenuItem("📡 接続先: 取得中...", callback=self.open_wifi_settings)
-        self.menu.add(self.ssid_menu)
-        
-        # 2. アラーム設定状態表示
-        self.alarm_status_menu = rumps.MenuItem("⌛️ 現在のアラーム設定：取得中...", callback=None)
-        self.menu.add(self.alarm_status_menu)
-        
+        # 1. 表示切替（ネット速度／接続時間）— クリックで表示モードを切り替える
+        self.display_toggle_menu = rumps.MenuItem("【表示内容】", callback=self.toggle_display_mode)
+        self.menu.add(self.display_toggle_menu)
+        self.speed_menu = rumps.MenuItem("📶 ネット速度", callback=self.show_speed_mode)
+        self.timer_display_menu = rumps.MenuItem("⏳ ネット接続時間", callback=self.show_timer_mode)
+        self.menu.add(self.speed_menu)
+        self.menu.add(self.timer_display_menu)
+
         self.menu.add(rumps.separator)
-        
-        # 3. 残りの設定項目
-        for item in [_item_timer, _item_safe, _item_toggle, _item_wifi]:
-            if item:
-                self.menu.add(item)
+
+        self.alert_setting_header = rumps.MenuItem("【フリーWi-fi 接続切れアラーム】", callback=self.do_nothing)
+        self.menu.add(self.alert_setting_header)
+
+        # 2. SSID表示（クリックでWi-Fi設定を開く）
+        self.ssid_menu = rumps.MenuItem("\U0001f6dc 現在の接続先: 取得中...", callback=self.open_wifi_settings)
+        self.menu.add(self.ssid_menu)
+
+        # 3. アラーム設定状態表示（クリックでON/OFFを切り替える）
+        self.alarm_status_menu = rumps.MenuItem("⌛️ アラーム設定：現在 取得中...", callback=self.toggle_alarm)
+        self.menu.add(self.alarm_status_menu)
+
+        # 4. 接続時間のリセット（アラーム設定の直下）
+        self.reset_timer_menu = rumps.MenuItem("🔄 接続時間のリセット", callback=self._reset_timer)
+        self.menu.add(self.reset_timer_menu)
+
+        # 5. 非通知Wi-Fiの設定
+        self.safe_wifi_menu = rumps.MenuItem("🏠 アラーム非通知wifiの設定", callback=self.manage_safe_wifi)
+        self.menu.add(self.safe_wifi_menu)
+
+        self.menu.add(rumps.separator)
+
+        # 6. タイマーの設定（○分後の通知をポップアップで設定）
+        self.timer_setting_menu = rumps.MenuItem("⏱️ タイマーの設定 [未設定]", callback=self.open_timer_setting_popup)
+        self.menu.add(self.timer_setting_menu)
+
+        self.menu.add(rumps.separator)
+        # この後ろに rumps が自動で Quit ボタンを追加する
 
     @staticmethod
     def escape_for_applescript(text):
@@ -124,7 +149,7 @@ class WiFiMonitorApp(rumps.App):
         # 最優先手段: CoreWLAN (Appleの公式フレームワーク)。位置情報の許可がある環境では即座に取得できる。
         try:
             import CoreWLAN
-            client = CoreWLAN.CWWiFiClient.sharedWiFiClient()
+            client = CoreWLAN.CWWiFiClient.sharedWiFiClient()  # type: ignore[attr-defined]
             interface = client.interface()
             if interface is not None:
                 ssid = interface.ssid()
@@ -366,36 +391,83 @@ class WiFiMonitorApp(rumps.App):
                 )
                 
                 # ※ここでは self.connected_time は None にしません（5分間の保留期間に入るため）
+                
+        # 初回の通信チェックが完了したことを記録
+        if not getattr(self, "first_check_done", False):
+            self.first_check_done = True
 
     @rumps.timer(1) # 1秒ごとに表示更新
     def update_display(self, _):
         # メニューの一番上のSSID表示を更新（軽量化のため変更がある場合のみ）
         if getattr(self, "is_online", False):
             ssid_name = getattr(self, "current_ssid", None) or "取得中..."
-            new_ssid_title = f"📡 接続先: {ssid_name}"
+            new_ssid_title = f"\U0001f6dc 現在の接続先: {ssid_name}"
         else:
-            prev_ssid = getattr(self, "current_ssid", None)
-            if prev_ssid:
-                new_ssid_title = f"📡 前回の接続先: {prev_ssid}"
-            else:
-                new_ssid_title = "📡 接続先: オフライン"
+            new_ssid_title = "\U0001f6dc 現在の接続：オフライン"
                 
         if self.ssid_menu.title != new_ssid_title:
             self.ssid_menu.title = new_ssid_title
+
+        # 表示モード切替メニューの「[表示中]」を更新（選択中の方にのみ表示）
+        speed_title = "📶 ネット速度 [表示中]" if self.display_mode == "ping" else "📶 ネット速度"
+        timer_title = "⏳ ネット接続時間 [表示中]" if self.display_mode == "timer" else "⏳ ネット接続時間"
+        if self.speed_menu.title != speed_title:
+            self.speed_menu.title = speed_title
+        if self.timer_display_menu.title != timer_title:
+            self.timer_display_menu.title = timer_title
 
         # アラーム設定状態メニューの更新（軽量化のため状態が変わった場合のみ再描画）
         alarm_state = (getattr(self, "is_safe_wifi", False), self.suppress_notif, tuple(self.target_minutes))
         if getattr(self, "_last_alarm_state", None) != alarm_state:
             self._last_alarm_state = alarm_state
             if alarm_state[0]:
-                self.alarm_status_menu.title = "⌛️ 現在のアラーム設定：OFF (非通知Wi-Fi)"
+                self.alarm_status_menu.title = "⌛️ アラーム設定：現在 OFF (非通知Wi-Fi)"
             elif alarm_state[1]:
-                self.alarm_status_menu.title = "⌛️ 現在のアラーム設定：OFF (通知無効化)"
+                self.alarm_status_menu.title = "⌛️ アラーム設定：現在 OFF (通知無効化)"
             elif not alarm_state[2]:
-                self.alarm_status_menu.title = "⌛️ 現在のアラーム設定：OFF"
+                self.alarm_status_menu.title = "⌛️ アラーム設定：現在 OFF"
             else:
                 targets_str = ", ".join(map(str, alarm_state[2]))
-                self.alarm_status_menu.title = f"⌛️ 現在のアラーム設定：ON（{targets_str}分後に通知）"
+                self.alarm_status_menu.title = f"⌛️ アラーム設定：現在 ON（{targets_str}分後に通知）"
+
+        # カスタムタイマーの処理
+        if getattr(self, "is_custom_timer_alert_showing", False):
+            pass  # アラート表示中はメニューの更新をスキップ
+        elif getattr(self, "custom_timer_end_time", None):
+            now = datetime.now()
+            remaining = self.custom_timer_end_time - now
+            if remaining.total_seconds() > 0:
+                rem_minutes = int(remaining.total_seconds() // 60)
+                rem_seconds = int(remaining.total_seconds() % 60)
+                # メニュー名に残り時間を更新（毎秒）
+                new_timer_menu_title = f"⏱️ {rem_minutes:02d}:{rem_seconds:02d}"
+                if self.timer_setting_menu.title != new_timer_menu_title:
+                    self.timer_setting_menu.title = new_timer_menu_title
+            else:
+                # タイマー終了処理開始
+                self.is_custom_timer_alert_showing = True
+                past_minutes = getattr(self, "custom_timer_duration_minutes", 0)
+                self.custom_timer_end_time = None
+                self.timer_setting_menu.title = "⏱️ 終了"
+                
+                # モーダルポップアップの作成
+                alert = AppKit.NSAlert.alloc().init()
+                alert.setMessageText_("タイマー終了")
+                alert.setInformativeText_(f"【{past_minutes}分】経過")
+                alert.addButtonWithTitle_("OK")
+                alert.addButtonWithTitle_("再度同じ時間で設定")
+                
+                AppKit.NSApp.activateIgnoringOtherApps_(True)
+                response = alert.runModal()
+                
+                self.is_custom_timer_alert_showing = False
+                if response == 1001:  # "再度同じ時間で設定"が押された場合 (2番目のボタン: 1001)
+                    self.custom_timer_end_time = datetime.now() + timedelta(minutes=past_minutes)
+                else:
+                    self.timer_setting_menu.title = "⏱️ タイマーの設定 [未設定]"
+        else:
+            if self.timer_setting_menu.title != "⏱️ タイマーの設定 [未設定]":
+                self.timer_setting_menu.title = "⏱️ タイマーの設定 [未設定]"
 
         if self.is_online and self.connected_time:
             now = datetime.now()
@@ -419,35 +491,39 @@ class WiFiMonitorApp(rumps.App):
                 
             # 目標時間経過していて、まだ通知していなければ（かつ通知オフ設定でなければ）アラート
             if not self.suppress_notif and active_targets:
-                for i, target in enumerate(active_targets):
-                    if elapsed_minutes >= target and target not in self.notified_targets:
-                        is_last_target = (i == len(active_targets) - 1)
-                        
-                        if is_last_target:
-                            # 最後のアラートタイミングの場合はスライダーではなくポップアップを表示
-                            title_text = f"Wi-Fi Monitor: ⚠️時間切れ直前 ({target}分経過)"
-                            alert_script = f'''
-                            tell application "System Events"
-                                activate
-                                set theResponse to button returned of (display alert "{title_text}" message "接続から{time_str}が経過しました。\\n\\n設定した通知時間({target}分)になりました。作業を保存してください！" buttons {{"OK", "Wi-Fi設定を開く"}} default button "OK" as warning)
-                                if theResponse is "Wi-Fi設定を開く" then
-                                    do shell script "open x-apple.systempreferences:com.apple.wifi-settings-extension"
-                                end if
-                            end tell
-                            '''
-                            threading.Thread(target=lambda: subprocess.run(["osascript", "-e", alert_script]), daemon=True).start()
-                        else:
-                            # 途中でのアラートはスライド通知のみ表示
-                            title_text = f"Wi-Fi Monitor: ⚠️時間切れ間近 ({target}分経過)"
-                            rumps.notification(
-                                title=title_text,
-                                subtitle=f"接続から{time_str}が経過しました",
-                                message="必要に応じて、作業を保存しましょう！",
-                                actionButton="Wi-Fi設定を開く",
-                                data={"action": "open_wifi_from_alert"}
-                            )
-                        
-                        self.notified_targets.add(target)
+                final_target = active_targets[-1]
+                # この更新タイミングで「新たに」到達した目標時間を集める。
+                # 設定変更直後など、既に複数の目標を過ぎている場合はここが複数件になる。
+                newly_passed = [t for t in active_targets if elapsed_minutes >= t and t not in self.notified_targets]
+                if newly_passed:
+                    # 到達した目標はすべて通知済みとして記録する。
+                    # （複数を個別に通知するとmacOSが連投を取りこぼすため、まとめて1回だけ通知する）
+                    for t in newly_passed:
+                        self.notified_targets.add(t)
+
+                    highest = max(newly_passed)
+                    if highest >= final_target:
+                        # 最終目標に到達 → スライドではなくポップアップで強く警告
+                        title_text = f"Wi-Fi Monitor: ⚠️時間切れ直前 ({highest}分経過)"
+                        alert_script = f'''
+                        tell application "System Events"
+                            activate
+                            set theResponse to button returned of (display alert "{title_text}" message "接続から{time_str}が経過しました。\\n\\n設定した通知時間({highest}分)になりました。作業を保存してください！" buttons {{"OK", "Wi-Fi設定を開く"}} default button "OK" as warning)
+                            if theResponse is "Wi-Fi設定を開く" then
+                                do shell script "open x-apple.systempreferences:com.apple.wifi-settings-extension"
+                            end if
+                        end tell
+                        '''
+                        threading.Thread(target=lambda: subprocess.run(["osascript", "-e", alert_script]), daemon=True).start()
+                    else:
+                        # 途中の目標 → スライド通知（1件のみ）
+                        title_text = f"Wi-Fi Monitor: ⚠️時間切れ間近 ({highest}分経過)"
+                        self._safe_notification(
+                            title=title_text,
+                            subtitle=f"接続から{time_str}が経過しました",
+                            message="必要に応じて、作業を保存しましょう！",
+                            action="open_wifi_from_alert"
+                        )
         else:
             # オフライン時の表示
             
@@ -457,9 +533,33 @@ class WiFiMonitorApp(rumps.App):
                 self.disconnected_time = None
                 self.notified_targets.clear()
                 
-            self.title = "🔴" if self.display_mode == "timer" else "🔴 オフライン"
+            if not getattr(self, "first_check_done", False):
+                self.title = "🌀" if self.display_mode == "timer" else "🌀 起動中..."
+            else:
+                self.title = "🔴" if self.display_mode == "timer" else "🔴 オフライン"
 
-    @rumps.clicked("🏠 アラーム非通知wifiの設定")
+    def _safe_notification(self, title, subtitle, message, action=None):
+        """ スライド通知を確実に表示する。
+        rumps.notification が失敗した場合は osascript の display notification で再試行する。 """
+        try:
+            kwargs = {"title": title, "subtitle": subtitle, "message": message}
+            if action:
+                kwargs["actionButton"] = "Wi-Fi設定を開く"
+                kwargs["data"] = {"action": action}
+            rumps.notification(**kwargs)  # type: ignore[arg-type]
+            return
+        except Exception:
+            pass
+        # フォールバック: osascript の display notification（rumps が使えない/失敗した場合）
+        try:
+            t = self.escape_for_applescript(title)
+            s = self.escape_for_applescript(subtitle)
+            m = self.escape_for_applescript(message)
+            script = f'display notification "{m}" with title "{t}" subtitle "{s}"'
+            threading.Thread(target=lambda: subprocess.run(["osascript", "-e", script]), daemon=True).start()
+        except Exception:
+            pass
+
     def manage_safe_wifi(self, _):
         """ 非通知（タイマー対象外）Wi-Fiの一覧表示・登録・解除をまとめて行うポップアップ """
         safe_list = getattr(self, "safe_ssids", []) or []
@@ -483,7 +583,7 @@ class WiFiMonitorApp(rumps.App):
 
         # ok=登録 / other=解除 / cancel=閉じる の3ボタン
         response = rumps.alert(
-            title="🏠 タイマー非通知wifiリスト",
+            title="タイマー非通知wifiリスト",
             message=message,
             ok="現在のWi-Fiを非通知リストに登録",
             cancel="閉じる",
@@ -568,52 +668,101 @@ class WiFiMonitorApp(rumps.App):
         self.update_display(None)
         rumps.notification("Wi-Fi Monitor", "解除完了", f"{removed_count} 件のWi-Fiを非通知リストから解除しました。")
 
-    @rumps.clicked("⏰ アラームの設定")
-    def manage_timer_settings(self, _):
-        """ タイマー設定の分岐用UI """
-        
-        if self.target_minutes:
-            current_setting_str = ", ".join(map(str, self.target_minutes))
-            display_text = f"【現在の設定: {current_setting_str} 分後】\n"
-        else:
-            display_text = "【タイマーが設定されていません】\n"
-        
-        if self.suppress_notif:
-            display_text += "⚠️ 通知が無効化されています\n"
-        
-        display_text += "\n"
+    def toggle_alarm(self, _):
+        """ アラーム設定メニュー：ON/OFFの切り替えと設定変更 """
+        if getattr(self, "is_safe_wifi", False):
+            rumps.alert("アラーム設定", "現在は非通知Wi-Fiに接続中のため、\nアラームは自動でOFFになっています。")
+            return
 
-        response = rumps.alert(
-            title="⚙️ タイマーの設定",
-            message=f"{display_text}実行する操作を選択してください。",
-            ok="通知時間の設定",
-            cancel="キャンセル",
-            other="時間カウントをリセットする"
-        )
-        if response == 1:
-            self._open_timer_settings()
-        elif response == -1:
-            self._reset_timer()
-
-    def _reset_timer(self):
-        """ カウントを現在時刻から0分にリセットする """
-        if self.is_online:
-            # リセット前に確認のポップアップを出す
+        if not self.target_minutes:
+            # --- 現在OFF → ONにするか確認 ---
             response = rumps.alert(
-                title="タイマーのリセット",
-                message="接続タイマーを0分にリセットしますか？",
-                ok="リセットする",
-                cancel="キャンセル"
+                title="⌛️ アラーム設定",
+                message="通知タイマーをONにしますか？",
+                ok="はい",
+                cancel="いいえ"
             )
-            
-            # responseが 1 (OK) の場合のみリセット処理を実行
-            if response == 1:
-                self.connected_time = datetime.now()
-                self.notified_targets.clear()
-                self.update_display(None)
-                rumps.notification("Wi-Fi Monitor", "タイマーをリセットしました", "カウントを0分にリセットしました")
+            if response != 1:
+                return
+
+            # ONにする（前回の設定を復元）
+            self.target_minutes = self.previous_target_minutes.copy() if getattr(self, "previous_target_minutes", []) else [50, 55]
+            self.suppress_notif = False
+            self.notified_targets.clear()
+            self._last_alarm_state = None
+            self.update_display(None)
+
+            # 現在の設定を確認するポップアップ
+            targets_str = ", ".join(map(str, self.target_minutes))
+            response2 = rumps.alert(
+                title="✅ タイマーをONにしました",
+                message=f"現在の通知タイミング：接続から {targets_str} 分後",
+                ok="OK",
+                other="設定を変更する →"
+            )
+            if response2 == -1:
+                self._open_timer_settings()
+
         else:
+            # --- 現在ON → 設定確認ポップアップ ---
+            targets_str = ", ".join(map(str, self.target_minutes))
+            response = rumps.alert(
+                title="⌛️ アラーム設定（現在 ON）",
+                message=f"現在の通知タイミング：接続から {targets_str} 分後",
+                ok="OK",
+                cancel="OFFにする",
+                other="設定を変更する →"
+            )
+            if response == -1:
+                self._open_timer_settings()
+            elif response == 0:
+                # OFFにする
+                self.previous_target_minutes = self.target_minutes.copy()
+                self.target_minutes = []
+                self.suppress_notif = True
+                self._last_alarm_state = None
+                self.update_display(None)
+                rumps.notification("Wi-Fi Monitor", "アラーム OFF", "通知タイマーをオフにしました")
+
+    def _reset_timer(self, _=None):
+        """ 接続時間を現在時刻から0分にリセットする """
+        if not self.is_online:
             rumps.alert("エラー", "Wi-Fiに接続されていないためリセットできません。")
+            return
+
+        # Step 1: リセット確認
+        response = rumps.alert(
+            title="接続時間のリセット",
+            message="接続時間をリセットしますか？",
+            ok="はい",
+            cancel="いいえ"
+        )
+        if response != 1:
+            return
+
+        # リセット実行
+        self.connected_time = datetime.now()
+        self.notified_targets.clear()
+        self._last_alarm_state = None
+        self.update_display(None)
+
+        # Step 2: アラームをONにするか確認
+        response2 = rumps.alert(
+            title="接続時間のリセット完了",
+            message="再度、フリーwifiアラートをONにしますか？",
+            ok="はい",
+            cancel="いいえ"
+        )
+        if response2 == 1:
+            self.target_minutes = self.previous_target_minutes.copy() if getattr(self, "previous_target_minutes", []) else [50, 55]
+            self.suppress_notif = False
+            self.notified_targets.clear()
+            self._last_alarm_state = None
+            self.update_display(None)
+            targets_str = ", ".join(map(str, self.target_minutes))
+            rumps.notification("Wi-Fi Monitor", "アラーム ON", f"接続から{targets_str}分後に通知します")
+        else:
+            rumps.notification("Wi-Fi Monitor", "接続時間をリセットしました", "カウントを0分にリセットしました")
 
     def _open_timer_settings(self):
         """ タイマーの時間を変更するポップアップウィンドウを表示 """
@@ -655,6 +804,7 @@ class WiFiMonitorApp(rumps.App):
                 
                 # 重複を省き、昇順に並べる
                 self.target_minutes = sorted(list(set(new_minutes)))
+                self.previous_target_minutes = self.target_minutes.copy()
                 
                 # 「50分後と55分後」のような表示用文字列を作成
                 # リストが1つの場合は「50分後」、複数の場合は「50分後と55分後」になるように調整
@@ -689,32 +839,108 @@ class WiFiMonitorApp(rumps.App):
             elif action == "open_wifi_from_alert":
                 self.open_wifi_settings(None)
 
-    @rumps.clicked("📶 表示切替 (接続時間 ⇆ Ping)")
-    def toggle_display_mode(self, _):
-        """ タイマー表示とPing速度表示を切り替える """
-        if self.display_mode == "timer":
-            self.display_mode = "ping"
-        else:
-            self.display_mode = "timer"
-            
-            # Pingから接続時間表示に戻したときにポップアップで確認
-            response = rumps.alert(
-                title="Wi-Fi時間通知を行います",
-                message="",
-                ok="OK（続行）",
-                cancel="通知しない"
-            )
-            
-            # responseは 0 (cancel) または 1 (ok) で返る
-            if response == 0:
-                self.suppress_notif = True
-            else:
-                self.suppress_notif = False
-                
+    def show_speed_mode(self, _):
+        """ メニューバー表示を「ネット速度(Ping)」に切り替える """
+        self.display_mode = "ping"
+        self._last_alarm_state = None  # キャッシュをリセットして強制的に再描画させる
         self.check_network(None)  # Ping状態を即時取得
         self.update_display(None) # 表示を即時更新
 
-    @rumps.clicked("🛜 Wi-Fi設定を開く")
+    def show_timer_mode(self, _):
+        """ メニューバー表示を「ネット接続時間」に切り替える """
+        self.display_mode = "timer"
+        self._last_alarm_state = None  # キャッシュをリセットして強制的に再描画させる
+        self.update_display(None) # 表示を即時更新
+
+    def toggle_display_mode(self, _):
+        """ 「【表示内容】」クリックで表示モードを切り替える """
+        if self.display_mode == "timer":
+            self.show_speed_mode(None)
+        else:
+            self.show_timer_mode(None)
+
+    def do_nothing(self, _):
+        """ 単なるテキスト表示用メニューアイテムのダミーコールバック """
+        pass
+
+    def open_timer_setting_popup(self, _):
+        """ 「タイマーの設定」メニュー: 独立したタイマー機能として動作 """
+        # PyObjC (AppKit) を使って複数の入力欄を持つカスタムダイアログを作成
+        alert = AppKit.NSAlert.alloc().init()
+        alert.setMessageText_("タイマーを設定する")
+        alert.addButtonWithTitle_("設定する")
+        alert.addButtonWithTitle_("キャンセル")
+
+        # カスタムビュー（入力欄が入るコンテナ）
+        view = AppKit.NSView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 300, 70))
+
+        # 1行目：名目（任意）
+        name_label = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(0, 40, 140, 20))
+        name_label.setStringValue_("タイマー名目（任意）")
+        name_label.setBezeled_(False)
+        name_label.setDrawsBackground_(False)
+        name_label.setEditable_(False)
+        name_label.setSelectable_(False)
+        view.addSubview_(name_label)
+
+        name_field = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(140, 40, 150, 20))
+        name_field.setPlaceholderString_("例: 作業集中")
+        view.addSubview_(name_field)
+
+        # 2行目：設定時間（分）
+        time_label = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(0, 10, 140, 20))
+        time_label.setStringValue_("タイマー設定")
+        time_label.setBezeled_(False)
+        time_label.setDrawsBackground_(False)
+        time_label.setEditable_(False)
+        time_label.setSelectable_(False)
+        view.addSubview_(time_label)
+
+        time_field = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(140, 10, 60, 20))
+        time_field.setPlaceholderString_("15")
+        view.addSubview_(time_field)
+
+        min_label = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(205, 10, 30, 20))
+        min_label.setStringValue_("分")
+        min_label.setBezeled_(False)
+        min_label.setDrawsBackground_(False)
+        min_label.setEditable_(False)
+        min_label.setSelectable_(False)
+        view.addSubview_(min_label)
+
+        alert.setAccessoryView_(view)
+        
+        # ウィンドウが他のアプリの裏に隠れないように手前に持ってくる
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+
+        response = alert.runModal()
+
+        if response == 1000:  # 設定する (1つめのボタン: 1000は NSAlertFirstButtonReturn)
+            timer_name = name_field.stringValue()
+            timer_time = time_field.stringValue()
+            
+            if not timer_time.isdigit():
+                rumps.alert("エラー", "タイマー設定には半角数字の「分」を入力してください。")
+                return
+
+            timer_minutes = int(timer_time)
+            if timer_minutes <= 0:
+                # 0が入力された場合はタイマーをリセット
+                self.custom_timer_end_time = None
+                self.custom_timer_name = ""
+                self.custom_timer_duration_minutes = 0
+                self.timer_setting_menu.title = "⏱️ タイマーの設定 [未設定]"
+                rumps.alert("タイマー解除", "タイマー設定を解除しました。")
+                return
+
+            # タイマー終了時刻を計算して保持
+            self.custom_timer_duration_minutes = timer_minutes
+            self.custom_timer_end_time = datetime.now() + timedelta(minutes=timer_minutes)
+            self.custom_timer_name = timer_name if timer_name else "タイマー"
+            
+            print(f"タイマー設定: 名目 '{self.custom_timer_name}', 時間 {timer_minutes}分")
+            # 設定完了ポップアップは出さず、次の1秒更新でメニューが「⏱️ mm:ss」表記に変わるのに任せる
+
     def open_wifi_settings(self, _):
         """ メニューからMacの標準Wi-Fi設定画面を開く """
         try:
