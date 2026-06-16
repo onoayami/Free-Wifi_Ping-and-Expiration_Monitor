@@ -928,21 +928,24 @@ class WiFiMonitorApp(rumps.App):
             and (self.custom_timer_end_time - datetime.now()).total_seconds() > 0
         )
         if _timer_active:
-            name_part = f"（{self.custom_timer_name}）" if self.custom_timer_name else ""
+            if self.custom_timer_name:
+                alert_title = f"「{self.custom_timer_name}」タイマー起動中"
+            else:
+                alert_title = "タイマー起動中"
             timer_alert = AppKit.NSAlert.alloc().init()
-            timer_alert.setMessageText_(f"タイマー起動中{name_part}")
+            timer_alert.setMessageText_(alert_title)
             timer_alert.setInformativeText_("タイマーをどうしますか？")
-            timer_alert.addButtonWithTitle_("タイマーの再設定")
-            timer_alert.addButtonWithTitle_("タイマーをオフにする")
+            timer_alert.addButtonWithTitle_("タイマーをかけ直す")
             timer_alert.addButtonWithTitle_("タイマーの時間を再設定する")
+            timer_alert.addButtonWithTitle_("タイマーをオフにする")
             timer_alert.addButtonWithTitle_("キャンセル")
             AppKit.NSApp.activateIgnoringOtherApps_(True)
             response = timer_alert.runModal()
-            if response == 1000:  # タイマーの再設定（同じ時間で再スタート）
+            if response == 1000:  # タイマーをかけ直す（同じ時間で再スタート）
                 self.custom_timer_end_time = datetime.now() + timedelta(minutes=self.custom_timer_duration_minutes)
                 self.display_mode = "custom_timer"
                 return
-            elif response == 1001:  # タイマーをオフにする
+            elif response == 1002:  # タイマーをオフにする
                 self.custom_timer_end_time = None
                 self.custom_timer_name = ""
                 self.custom_timer_duration_minutes = 0
@@ -950,7 +953,7 @@ class WiFiMonitorApp(rumps.App):
                 return
             elif response == 1003:  # キャンセル
                 return
-            # response == 1002: タイマーの時間を再設定する → そのまま下の設定ダイアログへ
+            # response == 1001: タイマーの時間を再設定する → そのまま下の設定ダイアログへ
 
         # PyObjC (AppKit) を使って複数の入力欄を持つカスタムダイアログを作成
         alert = AppKit.NSAlert.alloc().init()
