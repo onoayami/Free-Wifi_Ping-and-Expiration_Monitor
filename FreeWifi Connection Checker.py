@@ -39,6 +39,30 @@ class WiFiMonitorApp(rumps.App):
         # 最後にcheck_networkが実行された時刻（スリープ判定に使用）
         self.last_heartbeat = datetime.now()
 
+        # --- メニューを望む順序で再構築 ---
+        # 各メニュー項目をタイトルキーで取得しておく
+        _item_wifi   = self.menu.get("🛜 Wi-Fi設定を開く")
+        _item_safe   = self.menu.get("🏠 アラーム非通知wifiの設定")
+        _item_timer  = self.menu.get("⏰ アラームの設定")
+        _item_toggle = self.menu.get("📶 表示切替 (接続時間 ⇆ Ping)")
+
+        self.menu.clear()
+
+        # 1. SSID表示（クリックでWi-Fi設定を開く）
+        self.ssid_menu = rumps.MenuItem("📡 接続先: 取得中...", callback=self.open_wifi_settings)
+        self.menu.add(self.ssid_menu)
+        
+        # 2. アラーム設定状態表示
+        self.alarm_status_menu = rumps.MenuItem("⌛️ 現在のアラーム設定：取得中...", callback=None)
+        self.menu.add(self.alarm_status_menu)
+        
+        self.menu.add(rumps.separator)
+        
+        # 3. 残りの設定項目
+        for item in [_item_timer, _item_safe, _item_toggle, _item_wifi]:
+            if item:
+                self.menu.add(item)
+
     @staticmethod
     def escape_for_applescript(text):
         """ AppleScriptの文字列リテラルに安全に埋め込めるようエスケープする """
@@ -185,6 +209,10 @@ class WiFiMonitorApp(rumps.App):
 
     @rumps.timer(5) # 5秒ごとに通信チェック
     def check_network(self, _):
+        if getattr(self, "checking_network", False):
+            return
+        self.checking_network = True
+
         now = datetime.now()
         
         # 前回チェックからの経過時間を記録（スリープ判定に使用）
@@ -192,6 +220,18 @@ class WiFiMonitorApp(rumps.App):
         time_since_last_check = (now - self.last_heartbeat).total_seconds()
         self.last_heartbeat = now
 
+        # 通信チェックがメイン(UI)スレッドをブロックするのを防ぐため、別スレッドで処理
+        threading.Thread(target=self._async_check_network, args=(now, time_since_last_check), daemon=True).start()
+
+    def _async_check_network(self, now, time_since_last_check):
+        try:
+            self._async_check_network_impl(now, time_since_last_check)
+        except Exception:
+            pass
+        finally:
+            self.checking_network = False
+
+    def _async_check_network_impl(self, now, time_since_last_check):
         # フリーWi-Fi等の場合は、ここでインターネット抜けできているかをチェック
         raw_status = self.check_internet()
         if raw_status:
@@ -250,6 +290,7 @@ class WiFiMonitorApp(rumps.App):
                     self.display_mode = "timer" # 通常のWi-Fiの場合はタイマー表示に戻す
                     self.connected_time = now - timedelta(seconds=20)
                     self.notified_targets.clear()
+                    self.suppress_notif = False  # 新接続時は必ず通知を有効化する
                     
                     if was_sleeping and not ssid_changed:
                         time_str = self.connected_time.strftime("%H:%M")
@@ -328,6 +369,34 @@ class WiFiMonitorApp(rumps.App):
 
     @rumps.timer(1) # 1秒ごとに表示更新
     def update_display(self, _):
+        # メニューの一番上のSSID表示を更新（軽量化のため変更がある場合のみ）
+        if getattr(self, "is_online", False):
+            ssid_name = getattr(self, "current_ssid", None) or "取得中..."
+            new_ssid_title = f"📡 接続先: {ssid_name}"
+        else:
+            prev_ssid = getattr(self, "current_ssid", None)
+            if prev_ssid:
+                new_ssid_title = f"📡 前回の接続先: {prev_ssid}"
+            else:
+                new_ssid_title = "📡 接続先: オフライン"
+                
+        if self.ssid_menu.title != new_ssid_title:
+            self.ssid_menu.title = new_ssid_title
+
+        # アラーム設定状態メニューの更新（軽量化のため状態が変わった場合のみ再描画）
+        alarm_state = (getattr(self, "is_safe_wifi", False), self.suppress_notif, tuple(self.target_minutes))
+        if getattr(self, "_last_alarm_state", None) != alarm_state:
+            self._last_alarm_state = alarm_state
+            if alarm_state[0]:
+                self.alarm_status_menu.title = "⌛️ 現在のアラーム設定：OFF (非通知Wi-Fi)"
+            elif alarm_state[1]:
+                self.alarm_status_menu.title = "⌛️ 現在のアラーム設定：OFF (通知無効化)"
+            elif not alarm_state[2]:
+                self.alarm_status_menu.title = "⌛️ 現在のアラーム設定：OFF"
+            else:
+                targets_str = ", ".join(map(str, alarm_state[2]))
+                self.alarm_status_menu.title = f"⌛️ 現在のアラーム設定：ON（{targets_str}分後に通知）"
+
         if self.is_online and self.connected_time:
             now = datetime.now()
             total_seconds = int((now - self.connected_time).total_seconds())
@@ -366,7 +435,7 @@ class WiFiMonitorApp(rumps.App):
                                 end if
                             end tell
                             '''
-                            subprocess.Popen(["osascript", "-e", alert_script])
+                            threading.Thread(target=lambda: subprocess.run(["osascript", "-e", alert_script]), daemon=True).start()
                         else:
                             # 途中でのアラートはスライド通知のみ表示
                             title_text = f"Wi-Fi Monitor: ⚠️時間切れ間近 ({target}分経過)"
@@ -390,7 +459,7 @@ class WiFiMonitorApp(rumps.App):
                 
             self.title = "🔴" if self.display_mode == "timer" else "🔴 オフライン"
 
-    @rumps.clicked("🏠 タイマー非通知wifi設定")
+    @rumps.clicked("🏠 アラーム非通知wifiの設定")
     def manage_safe_wifi(self, _):
         """ 非通知（タイマー対象外）Wi-Fiの一覧表示・登録・解除をまとめて行うポップアップ """
         safe_list = getattr(self, "safe_ssids", []) or []
@@ -499,12 +568,24 @@ class WiFiMonitorApp(rumps.App):
         self.update_display(None)
         rumps.notification("Wi-Fi Monitor", "解除完了", f"{removed_count} 件のWi-Fiを非通知リストから解除しました。")
 
-    @rumps.clicked("⚙️ タイマーの設定")
+    @rumps.clicked("⏰ アラームの設定")
     def manage_timer_settings(self, _):
         """ タイマー設定の分岐用UI """
+        
+        if self.target_minutes:
+            current_setting_str = ", ".join(map(str, self.target_minutes))
+            display_text = f"【現在の設定: {current_setting_str} 分後】\n"
+        else:
+            display_text = "【タイマーが設定されていません】\n"
+        
+        if self.suppress_notif:
+            display_text += "⚠️ 通知が無効化されています\n"
+        
+        display_text += "\n"
+
         response = rumps.alert(
             title="⚙️ タイマーの設定",
-            message="実行する操作を選択してください。",
+            message=f"{display_text}実行する操作を選択してください。",
             ok="通知時間の設定",
             cancel="キャンセル",
             other="時間カウントをリセットする"
@@ -536,19 +617,19 @@ class WiFiMonitorApp(rumps.App):
 
     def _open_timer_settings(self):
         """ タイマーの時間を変更するポップアップウィンドウを表示 """
-        # 現在の設定をカンマ区切りで表示準備
-        current_setting_str = ", ".join(map(str, self.target_minutes)) if self.target_minutes else "0"
-        
-        # 現在のステータスをテキスト化
+        # 現在のステータスと入力欄のデフォルト値を準備
         if self.target_minutes:
+            current_setting_str = ", ".join(map(str, self.target_minutes))
             current_display = f"【現在の設定: {current_setting_str} 分後】"
+            default_input = current_setting_str
         else:
-            current_display = "【現在の設定: オフ(通知しない)】"
+            current_display = "【タイマーが設定されていません】"
+            default_input = "50, 55" # タイマーがオフの時はデフォルトで50, 55を入れる
         
         window = rumps.Window(
             title="通知タイマーの設定",
             message=f"{current_display}\n\n接続開始から何分後に通知を出しますか？\n複数設定する場合はカンマで区切ってください（例: 50, 55）\n※ 0 を入力すると通知をオフにできます。",
-            default_text=current_setting_str,
+            default_text=default_input,
             dimensions=(200, 20),
             ok="設定する",
             cancel="キャンセル"
@@ -589,13 +670,10 @@ class WiFiMonitorApp(rumps.App):
                     message=f"反映されました！\n接続から{setting_display}に通知します。"
                 )
                 
-                # この時点で既に過ぎている時間は通知済みにする（再設定時に即アラートが出るのを防ぐため）
-                if self.is_online and self.connected_time:
-                    now = datetime.now()
-                    elapsed_minutes = int((now - self.connected_time).total_seconds()) // 60
-                    self.notified_targets = {m for m in self.target_minutes if elapsed_minutes >= m}
-                else:
-                    self.notified_targets.clear()
+                # タイマーを再設定した場合は通知フラグを確実にオフ（通知する）にし、
+                # 既に時間を過ぎている設定値があればすぐアラートが出るよう対象をクリアする
+                self.suppress_notif = False
+                self.notified_targets.clear()
                 
                 self.update_display(None)
             except ValueError:
@@ -611,7 +689,7 @@ class WiFiMonitorApp(rumps.App):
             elif action == "open_wifi_from_alert":
                 self.open_wifi_settings(None)
 
-    @rumps.clicked("⏱️ 表示切替 (接続時間 ⇆ Ping)")
+    @rumps.clicked("📶 表示切替 (接続時間 ⇆ Ping)")
     def toggle_display_mode(self, _):
         """ タイマー表示とPing速度表示を切り替える """
         if self.display_mode == "timer":
