@@ -55,8 +55,11 @@ class WiFiMonitorApp(rumps.App):
         self.menu.add(self.display_toggle_menu)
         self.speed_menu = rumps.MenuItem("📶 ネット速度", callback=self.show_speed_mode)
         self.timer_display_menu = rumps.MenuItem("⏳ ネット接続時間", callback=self.show_timer_mode)
+        self.countdown_display_menu = rumps.MenuItem("⏱️ タイマー残り時間", callback=self.show_countdown_mode)
         self.menu.add(self.speed_menu)
         self.menu.add(self.timer_display_menu)
+        self.menu.add(self.countdown_display_menu)
+        self.countdown_display_menu._menuitem.setHidden_(True)
 
         self.menu.add(rumps.separator)
 
@@ -82,7 +85,7 @@ class WiFiMonitorApp(rumps.App):
         self.menu.add(rumps.separator)
 
         # 6. タイマーの設定（○分後の通知をポップアップで設定）
-        self.timer_setting_menu = rumps.MenuItem("⏱️ タイマーの設定 [未設定]", callback=self.open_timer_setting_popup)
+        self.timer_setting_menu = rumps.MenuItem("⏱️タイマーの設定", callback=self.open_timer_setting_popup)
         self.menu.add(self.timer_setting_menu)
 
         self.menu.add(rumps.separator)
@@ -403,18 +406,38 @@ class WiFiMonitorApp(rumps.App):
             ssid_name = getattr(self, "current_ssid", None) or "取得中..."
             new_ssid_title = f"\U0001f6dc 現在の接続先: {ssid_name}"
         else:
-            new_ssid_title = "\U0001f6dc 現在の接続：オフライン"
+            new_ssid_title = "\U0001f6dc 現在の接続：オフライン（クリックしてWifi設定を開く）"
                 
         if self.ssid_menu.title != new_ssid_title:
             self.ssid_menu.title = new_ssid_title
 
+        # カスタムタイマーの有効状態を先に確認（表示制御に使用）
+        _custom_timer_active = (
+            getattr(self, "custom_timer_end_time", None) is not None
+            and not getattr(self, "is_custom_timer_alert_showing", False)
+            and (self.custom_timer_end_time - datetime.now()).total_seconds() > 0
+        )
+        # タイマーが無効になっていて表示モードが "custom_timer" なら "timer" に戻す
+        if not _custom_timer_active and self.display_mode == "custom_timer":
+            self.display_mode = "timer"
+        # カスタムタイマーのメニュー項目を表示・非表示
+        self.countdown_display_menu._menuitem.setHidden_(not _custom_timer_active)
+        # タイマー残り時間の計算（バー表示に使用）
+        _custom_rem_str = ""
+        if _custom_timer_active:
+            _rem = (self.custom_timer_end_time - datetime.now()).total_seconds()
+            _custom_rem_str = f"⏱️ {int(_rem // 60):02d}:{int(_rem % 60):02d}"
+
         # 表示モード切替メニューの「[表示中]」を更新（選択中の方にのみ表示）
         speed_title = "📶 ネット速度 [表示中]" if self.display_mode == "ping" else "📶 ネット速度"
         timer_title = "⏳ ネット接続時間 [表示中]" if self.display_mode == "timer" else "⏳ ネット接続時間"
+        countdown_title = "⏱️ タイマー残り時間 [表示中]" if self.display_mode == "custom_timer" else "⏱️ タイマー残り時間"
         if self.speed_menu.title != speed_title:
             self.speed_menu.title = speed_title
         if self.timer_display_menu.title != timer_title:
             self.timer_display_menu.title = timer_title
+        if self.countdown_display_menu.title != countdown_title:
+            self.countdown_display_menu.title = countdown_title
 
         # アラーム設定状態メニューの更新（軽量化のため状態が変わった場合のみ再描画）
         alarm_state = (getattr(self, "is_safe_wifi", False), self.suppress_notif, tuple(self.target_minutes))
@@ -440,7 +463,11 @@ class WiFiMonitorApp(rumps.App):
                 rem_minutes = int(remaining.total_seconds() // 60)
                 rem_seconds = int(remaining.total_seconds() % 60)
                 # メニュー名に残り時間を更新（毎秒）
-                new_timer_menu_title = f"⏱️ {rem_minutes:02d}:{rem_seconds:02d}"
+                if getattr(self, "custom_timer_name", ""):
+                    new_timer_menu_title = f"⏱️タイマー起動中（{self.custom_timer_name}）：タイマーの再設定"
+                else:
+                    new_timer_menu_title = "⏱️タイマー起動中：タイマーの再設定"
+                
                 if self.timer_setting_menu.title != new_timer_menu_title:
                     self.timer_setting_menu.title = new_timer_menu_title
             else:
@@ -448,7 +475,7 @@ class WiFiMonitorApp(rumps.App):
                 self.is_custom_timer_alert_showing = True
                 past_minutes = getattr(self, "custom_timer_duration_minutes", 0)
                 self.custom_timer_end_time = None
-                self.timer_setting_menu.title = "⏱️ 終了"
+                self.timer_setting_menu.title = "⏱️タイマーの設定"
                 
                 # モーダルポップアップの作成
                 alert = AppKit.NSAlert.alloc().init()
@@ -463,11 +490,12 @@ class WiFiMonitorApp(rumps.App):
                 self.is_custom_timer_alert_showing = False
                 if response == 1001:  # "再度同じ時間で設定"が押された場合 (2番目のボタン: 1001)
                     self.custom_timer_end_time = datetime.now() + timedelta(minutes=past_minutes)
+                    self.display_mode = "custom_timer"  # カウントダウン表示に戻す
                 else:
-                    self.timer_setting_menu.title = "⏱️ タイマーの設定 [未設定]"
+                    self.timer_setting_menu.title = "⏱️タイマーの設定"
         else:
-            if self.timer_setting_menu.title != "⏱️ タイマーの設定 [未設定]":
-                self.timer_setting_menu.title = "⏱️ タイマーの設定 [未設定]"
+            if self.timer_setting_menu.title != "⏱️タイマーの設定":
+                self.timer_setting_menu.title = "⏱️タイマーの設定"
 
         if self.is_online and self.connected_time:
             now = datetime.now()
@@ -484,10 +512,13 @@ class WiFiMonitorApp(rumps.App):
             # 目標時間以上経過している場合は警告表示（タイマー表示時のみ）、それ以外は通常表示
             active_targets = sorted([m for m in self.target_minutes if m > 0])
             
-            if getattr(self, "is_safe_wifi", False):
-                self.title = f"🏠 {time_str}" if self.display_mode == "timer" else self.cached_ping_display
+            _icon = "🏠" if getattr(self, "is_safe_wifi", False) else "🌐"
+            if self.display_mode == "timer":
+                self.title = f"{_icon} {time_str}"
+            elif self.display_mode == "custom_timer" and _custom_rem_str:
+                self.title = _custom_rem_str
             else:
-                self.title = f"🌐 {time_str}" if self.display_mode == "timer" else self.cached_ping_display
+                self.title = self.cached_ping_display
                 
             # 目標時間経過していて、まだ通知していなければ（かつ通知オフ設定でなければ）アラート
             if not self.suppress_notif and active_targets:
@@ -534,9 +565,19 @@ class WiFiMonitorApp(rumps.App):
                 self.notified_targets.clear()
                 
             if not getattr(self, "first_check_done", False):
-                self.title = "🌀" if self.display_mode == "timer" else "🌀 起動中..."
+                if self.display_mode == "custom_timer" and _custom_rem_str:
+                    self.title = _custom_rem_str
+                elif self.display_mode == "timer":
+                    self.title = "🌀"
+                else:
+                    self.title = "🌀 起動中..."
             else:
-                self.title = "🔴" if self.display_mode == "timer" else "🔴 オフライン"
+                if self.display_mode == "custom_timer" and _custom_rem_str:
+                    self.title = _custom_rem_str
+                elif self.display_mode == "timer":
+                    self.title = "🔴"
+                else:
+                    self.title = "🔴 オフライン"
 
     def _safe_notification(self, title, subtitle, message, action=None):
         """ スライド通知を確実に表示する。
@@ -852,11 +893,26 @@ class WiFiMonitorApp(rumps.App):
         self._last_alarm_state = None  # キャッシュをリセットして強制的に再描画させる
         self.update_display(None) # 表示を即時更新
 
+    def show_countdown_mode(self, _):
+        """ メニューバー表示を「タイマー残り時間」に切り替える """
+        self.display_mode = "custom_timer"
+        self._last_alarm_state = None
+        self.update_display(None)
+
     def toggle_display_mode(self, _):
         """ 「【表示内容】」クリックで表示モードを切り替える """
+        timer_available = (
+            getattr(self, "custom_timer_end_time", None) is not None
+            and not getattr(self, "is_custom_timer_alert_showing", False)
+        )
         if self.display_mode == "timer":
             self.show_speed_mode(None)
-        else:
+        elif self.display_mode == "ping":
+            if timer_available:
+                self.show_countdown_mode(None)
+            else:
+                self.show_timer_mode(None)
+        else:  # custom_timer
             self.show_timer_mode(None)
 
     def do_nothing(self, _):
@@ -865,6 +921,37 @@ class WiFiMonitorApp(rumps.App):
 
     def open_timer_setting_popup(self, _):
         """ 「タイマーの設定」メニュー: 独立したタイマー機能として動作 """
+        # タイマーが起動中の場合は再設定ポップアップを表示
+        _timer_active = (
+            getattr(self, "custom_timer_end_time", None) is not None
+            and not getattr(self, "is_custom_timer_alert_showing", False)
+            and (self.custom_timer_end_time - datetime.now()).total_seconds() > 0
+        )
+        if _timer_active:
+            name_part = f"（{self.custom_timer_name}）" if self.custom_timer_name else ""
+            timer_alert = AppKit.NSAlert.alloc().init()
+            timer_alert.setMessageText_(f"タイマー起動中{name_part}")
+            timer_alert.setInformativeText_("タイマーをどうしますか？")
+            timer_alert.addButtonWithTitle_("タイマーの再設定")
+            timer_alert.addButtonWithTitle_("タイマーをオフにする")
+            timer_alert.addButtonWithTitle_("タイマーの時間を再設定する")
+            timer_alert.addButtonWithTitle_("キャンセル")
+            AppKit.NSApp.activateIgnoringOtherApps_(True)
+            response = timer_alert.runModal()
+            if response == 1000:  # タイマーの再設定（同じ時間で再スタート）
+                self.custom_timer_end_time = datetime.now() + timedelta(minutes=self.custom_timer_duration_minutes)
+                self.display_mode = "custom_timer"
+                return
+            elif response == 1001:  # タイマーをオフにする
+                self.custom_timer_end_time = None
+                self.custom_timer_name = ""
+                self.custom_timer_duration_minutes = 0
+                self.timer_setting_menu.title = "⏱️タイマーの設定"
+                return
+            elif response == 1003:  # キャンセル
+                return
+            # response == 1002: タイマーの時間を再設定する → そのまま下の設定ダイアログへ
+
         # PyObjC (AppKit) を使って複数の入力欄を持つカスタムダイアログを作成
         alert = AppKit.NSAlert.alloc().init()
         alert.setMessageText_("タイマーを設定する")
@@ -884,7 +971,7 @@ class WiFiMonitorApp(rumps.App):
         view.addSubview_(name_label)
 
         name_field = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(140, 40, 150, 20))
-        name_field.setPlaceholderString_("例: 作業集中")
+        name_field.setPlaceholderString_("例：ポモドーロ")
         view.addSubview_(name_field)
 
         # 2行目：設定時間（分）
@@ -920,7 +1007,7 @@ class WiFiMonitorApp(rumps.App):
             timer_time = time_field.stringValue()
             
             if not timer_time.isdigit():
-                rumps.alert("エラー", "タイマー設定には半角数字の「分」を入力してください。")
+                rumps.alert("エラー", "タイマー設定には半角数字で何「分」の形で入力してください。")
                 return
 
             timer_minutes = int(timer_time)
@@ -929,14 +1016,15 @@ class WiFiMonitorApp(rumps.App):
                 self.custom_timer_end_time = None
                 self.custom_timer_name = ""
                 self.custom_timer_duration_minutes = 0
-                self.timer_setting_menu.title = "⏱️ タイマーの設定 [未設定]"
+                self.timer_setting_menu.title = "⏱️タイマーの設定"
                 rumps.alert("タイマー解除", "タイマー設定を解除しました。")
                 return
 
             # タイマー終了時刻を計算して保持
             self.custom_timer_duration_minutes = timer_minutes
             self.custom_timer_end_time = datetime.now() + timedelta(minutes=timer_minutes)
-            self.custom_timer_name = timer_name if timer_name else "タイマー"
+            self.custom_timer_name = timer_name.strip() if timer_name else ""
+            self.display_mode = "custom_timer"  # タイマー設定直後にカウントダウン表示へ切り替え
             
             print(f"タイマー設定: 名目 '{self.custom_timer_name}', 時間 {timer_minutes}分")
             # 設定完了ポップアップは出さず、次の1秒更新でメニューが「⏱️ mm:ss」表記に変わるのに任せる
