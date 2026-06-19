@@ -345,7 +345,7 @@ class WiFiMonitorApp(rumps.App):
                             osascript_cmd = f'''
                             tell application "System Events"
                                 activate
-                                set dialogResult to display dialog "未登録のWi-Fi ({ssid_disp}) に接続しました。\\n何分後に通知タイマーをスタートしますか？\\n※複数設定はカンマ区切り\\n※キャンセルで通知をオフにします" default answer "50, 55" buttons {{"キャンセル", "スタート"}} default button "スタート" cancel button "キャンセル" with title "Wi-Fi Monitor" as informational
+                                set dialogResult to display dialog "未登録のWi-Fi ({ssid_disp}) に接続しました。\\n何分後に通知タイマーをスタートしますか？\\n※複数設定はカンマ区切り\\n※キャンセルで通知をオフにします" default answer "50, 55" buttons {{"キャンセル", "スタート"}} default button "スタート" cancel button "キャンセル" with title "Wi-Fi Monitor"
                                 return text returned of dialogResult
                             end tell
                             '''
