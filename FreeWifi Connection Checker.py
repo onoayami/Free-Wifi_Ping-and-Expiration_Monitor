@@ -8,9 +8,27 @@ import json
 import os
 import re
 import threading
+import logging
 
 # PyObjCの動的属性(NSAlert等)を型チェッカーが認識できず誤検知を出すため、Any扱いにする
 AppKit = cast(Any, _AppKit)
+
+# --- ロギング設定（P6: 握りつぶしていた例外を debug ログとして残し、原因切り分けを可能にする） ---
+# 既定では警告以上のみ。環境変数 WIFIMONITOR_DEBUG=1 を設定すると詳細(debug)ログが有効になる。
+logger = logging.getLogger("wifimonitor")
+if not logger.handlers:
+    _log_level = logging.DEBUG if os.environ.get("WIFIMONITOR_DEBUG") else logging.WARNING
+    logger.setLevel(_log_level)
+    _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    try:
+        _file_handler = logging.FileHandler(os.path.expanduser("~/.wifimonitor.log"))
+        _file_handler.setFormatter(_formatter)
+        logger.addHandler(_file_handler)
+    except Exception:
+        pass  # ログファイルが作れない環境でもアプリ本体は動かす
+    _stream_handler = logging.StreamHandler()
+    _stream_handler.setFormatter(_formatter)
+    logger.addHandler(_stream_handler)
 
 # Macの下のDock（メニューバー）に実行中のPythonアイコンを表示しないための設定
 info = AppKit.NSBundle.mainBundle().infoDictionary()  # type: ignore[attr-defined]
@@ -54,9 +72,26 @@ class WiFiMonitorApp(rumps.App):
         self.vpn_connected = False  # 現在VPNに接続しているか
         self.vpn_name = None        # 接続中VPNの名前
         self._last_vpn_state = None # メニュー再描画最適化用キャッシュ
+        # P4: VPN状態の取得(scutil/ifconfig/ps の全走査)は重いため毎回は行わず間引く
+        self._last_vpn_fetch = None  # 最後にVPN状態を実取得した時刻
+        self.vpn_refresh_interval = 20  # VPN状態を再取得する最短間隔（秒）
 
         # 最後にcheck_networkが実行された時刻（スリープ判定に使用）
         self.last_heartbeat = datetime.now()
+
+        # --- スレッド安全な通知キュー（P2: ワーカースレッドからのAppKit直叩きを避ける） ---
+        # ワーカースレッドからは self._queue_notification() でここに積み、
+        # メインスレッドの update_display(@rumps.timer) が排出して実際に通知する。
+        self._pending_notifications = []
+        self._notif_lock = threading.Lock()
+
+        # --- 接続状態の共有ロック（P5: ワーカーとメインスレッドの読み書き競合を防ぐ） ---
+        # is_online / connected_time / notified_targets などの複合的な状態遷移を保護する。
+        self._state_lock = threading.Lock()
+
+        # --- SSID取得のキャッシュ（P1: 5秒ごとの重い再取得を間引く） ---
+        self._last_ssid_fetch = None  # 最後にSSIDを実取得した時刻
+        self.ssid_refresh_interval = 60  # オンライン中にSSIDを再取得する最短間隔（秒）
 
         # --- メニューを望む順序で再構築 ---
         self.menu.clear()
@@ -126,13 +161,23 @@ class WiFiMonitorApp(rumps.App):
         # バックスラッシュを先にエスケープし、その後ダブルクォートをエスケープする
         return str(text).replace("\\", "\\\\").replace('"', '\\"')
 
+    def _queue_notification(self, title, subtitle, message):
+        """ ワーカースレッドからの通知をメインスレッドで安全に出すためキューに積む。
+        AppKit/rumps の通知APIはメインスレッドからの呼び出しが原則のため、
+        ここでは実際の発火を行わず、メインスレッドの update_display で排出して通知する。 """
+        try:
+            with self._notif_lock:
+                self._pending_notifications.append((title, subtitle, message))
+        except Exception:
+            logger.debug("通知のキュー追加に失敗", exc_info=True)
+
     def load_safe_ssids(self):
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:
-                pass
+                logger.debug("safe_ssids の読み込みに失敗", exc_info=True)
         return []
 
     def save_safe_ssids(self):
@@ -140,7 +185,7 @@ class WiFiMonitorApp(rumps.App):
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.safe_ssids, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass
+            logger.debug("safe_ssids の保存に失敗", exc_info=True)
 
     def load_settings(self):
         """ アプリ設定(VPN機能のON/OFFなど)をJSONから読み込む """
@@ -151,7 +196,7 @@ class WiFiMonitorApp(rumps.App):
                     if isinstance(data, dict):
                         return data
             except Exception:
-                pass
+                logger.debug("settings の読み込みに失敗", exc_info=True)
         return {}
 
     def save_settings(self):
@@ -160,7 +205,7 @@ class WiFiMonitorApp(rumps.App):
             with open(self.settings_path, "w", encoding="utf-8") as f:
                 json.dump({"vpn_feature_enabled": self.vpn_feature_enabled}, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass
+            logger.debug("settings の保存に失敗", exc_info=True)
 
     def get_wifi_device(self):
         """ Wi-Fiのインターフェース名(en0など)を動的に取得する。機種差に対応。 """
@@ -177,7 +222,7 @@ class WiFiMonitorApp(rumps.App):
                     self._wifi_device = m.group(1)
                     return self._wifi_device
         except Exception:
-            pass
+            logger.debug("Wi-Fiデバイス名の取得に失敗（en0で代用）", exc_info=True)
         # 取得できなければ一般的なen0をフォールバックとして使う
         return "en0"
 
@@ -206,7 +251,7 @@ class WiFiMonitorApp(rumps.App):
                 if _valid(ssid):
                     return str(ssid)
         except Exception:
-            pass
+            logger.debug("CoreWLAN によるSSID取得に失敗（次手段へ）", exc_info=True)
 
         # 主手段: ipconfig getsummary <device> の出力からSSID行を抽出
         try:
@@ -217,7 +262,7 @@ class WiFiMonitorApp(rumps.App):
                 if m and _valid(m.group(1)):
                     return m.group(1).strip()
         except Exception:
-            pass
+            logger.debug("ipconfig getsummary によるSSID取得に失敗（次手段へ）", exc_info=True)
 
         # 確実なフォールバック: system_profiler は位置情報の許可が無くても実SSIDを返す（やや低速）。
         # "Current Network Information:" の次行にSSID名（末尾コロン付き）が出力される。
@@ -228,7 +273,7 @@ class WiFiMonitorApp(rumps.App):
                 if m and _valid(m.group(1)):
                     return m.group(1).strip()
         except Exception:
-            pass
+            logger.debug("system_profiler によるSSID取得に失敗（次手段へ）", exc_info=True)
 
         # 最後のフォールバック: 旧来の networksetup（位置情報権限がある環境では機能する）
         try:
@@ -238,7 +283,7 @@ class WiFiMonitorApp(rumps.App):
                 if _valid(ssid):
                     return ssid
         except Exception:
-            pass
+            logger.debug("networksetup によるSSID取得に失敗", exc_info=True)
 
         return None
 
@@ -268,7 +313,8 @@ class WiFiMonitorApp(rumps.App):
         """ Google Public DNS (8.8.8.8) にpingを打って応答速度と絵文字を含んだ文字列を返す """
         try:
             # macOS用ping: -c 1(1回), -t 1(1秒タイムアウト)
-            result = subprocess.run(["ping", "-c", "1", "-t", "1", "8.8.8.8"], capture_output=True, text=True)
+            # ping自体がハングした場合にスレッドを永久に拘束しないようPython側にもtimeoutを付ける
+            result = subprocess.run(["ping", "-c", "1", "-t", "1", "8.8.8.8"], capture_output=True, text=True, timeout=2)
             if result.returncode == 0 and "time=" in result.stdout:
                 time_str = result.stdout.split("time=")[1].split(" ms")[0]
                 ping_ms = float(time_str)
@@ -357,7 +403,7 @@ class WiFiMonitorApp(rumps.App):
                                 service = self._detect_vpn_service_name()
                                 return True, (service if service else f"VPN ({current_if})")
         except Exception:
-            pass
+            logger.debug("VPN状態の取得に失敗", exc_info=True)
         return False, None
 
     @rumps.timer(2)  # 2秒ごとにPing速度を取得（ping -c1のみの軽い処理）
@@ -375,7 +421,7 @@ class WiFiMonitorApp(rumps.App):
         try:
             self.cached_ping_display = self.get_ping_status()
         except Exception:
-            pass
+            logger.debug("Ping表示の更新に失敗", exc_info=True)
         finally:
             self.checking_ping = False
 
@@ -399,7 +445,7 @@ class WiFiMonitorApp(rumps.App):
         try:
             self._async_check_network_impl(now, time_since_last_check)
         except Exception:
-            pass
+            logger.debug("通信チェック処理で例外発生", exc_info=True)
         finally:
             self.checking_network = False
 
@@ -425,19 +471,44 @@ class WiFiMonitorApp(rumps.App):
             self.cached_ping_display = ""
 
         # VPN機能が有効な場合のみ、VPNの接続状態を取得する（無効時は負荷をかけない）
+        # P4: scutil/ifconfig/ps の全走査は重いため、前回取得から一定時間経過した時のみ実取得する。
+        # ただしオフライン→オンライン復帰直後はVPN状態が変わりやすいので、throttleを無視して即取得する。
         if getattr(self, "vpn_feature_enabled", False):
-            self.vpn_connected, self.vpn_name = self.get_vpn_status()
+            is_online_transition = current_status and not getattr(self, "is_online", False)
+            last_vpn = getattr(self, "_last_vpn_fetch", None)
+            vpn_due = (
+                is_online_transition
+                or last_vpn is None
+                or (now - last_vpn).total_seconds() >= getattr(self, "vpn_refresh_interval", 20)
+            )
+            if vpn_due:
+                self.vpn_connected, self.vpn_name = self.get_vpn_status()
+                self._last_vpn_fetch = now
 
         if current_status:
-            # SSIDの取得はオンライン時のみ行う（オフライン時は未使用のため省略して負荷を下げる）
-            new_ssid = self.get_current_ssid()
+            # SSIDの再取得は重い（最悪 system_profiler まで落ちると最大8秒）ため、毎回は行わない。
+            # ・オフライン→オンラインへの遷移時（必ず取得）
+            # ・前回取得から ssid_refresh_interval 秒以上経過した時（ネットワーク切替検知用の保険）
+            # それ以外はキャッシュ済みの current_ssid を使い回して負荷を下げる。
+            is_transition = not getattr(self, "is_online", False)
+            last_fetch = getattr(self, "_last_ssid_fetch", None)
+            refresh_due = (
+                last_fetch is None
+                or (now - last_fetch).total_seconds() >= getattr(self, "ssid_refresh_interval", 60)
+            )
+            if is_transition or refresh_due:
+                new_ssid = self.get_current_ssid()
+                self._last_ssid_fetch = now
+            else:
+                new_ssid = self.current_ssid
             ssid_changed = self.current_ssid is not None and new_ssid is not None and self.current_ssid != new_ssid
             # 【オフライン -> オンライン】に切り替わった瞬間 または SSIDが変わった瞬間
             if not getattr(self, "is_online", False) or ssid_changed:
-                self.is_online = True
-                self.current_ssid = new_ssid
-                is_safe = (self.current_ssid in getattr(self, "safe_ssids", [])) if self.current_ssid else False
-                self.is_safe_wifi = is_safe
+                with self._state_lock:
+                    self.is_online = True
+                    self.current_ssid = new_ssid
+                    is_safe = (self.current_ssid in getattr(self, "safe_ssids", [])) if self.current_ssid else False
+                    self.is_safe_wifi = is_safe
                 
                 # 前回切断時から5分(300秒)以内の復帰かどうかを確認
                 offline_seconds = (now - self.disconnected_time).total_seconds() if self.disconnected_time else 9999
@@ -445,38 +516,40 @@ class WiFiMonitorApp(rumps.App):
                 was_sleeping = time_since_last_check >= 30
                 
                 if is_safe:
-                    self.target_minutes = []
-                    self.connected_time = now - timedelta(seconds=20)
-                    self.notified_targets.clear()
-                    self.display_mode = "ping"  # 非通知Wi-Fiの場合は自動でPing表示にする
-                    rumps.notification(
+                    with self._state_lock:
+                        self.target_minutes = []
+                        self.connected_time = now - timedelta(seconds=20)
+                        self.notified_targets.clear()
+                        self.display_mode = "ping"  # 非通知Wi-Fiの場合は自動でPing表示にする
+                    self._queue_notification(
                         title="Wi-Fi Monitor",
                         subtitle=f"🏠 安全なWi-Fiに接続: {self.current_ssid}",
                         message="接続タイマーは動作しません。"
                     )
                 elif not ssid_changed and is_within_5min and was_sleeping:
                     # 5分以内の離席（同一Wi-Fi）復帰 → タイマーを継続する
-                    rumps.notification(
+                    self._queue_notification(
                         title="Wi-Fi Monitor",
                         subtitle="💤 スリープから復帰しました",
                         message="前回のタイマーを継続します"
                     )
                 else:
                     # 新規接続・ネットワーク変更・5分以上経過 → リセットして通知設定ポップアップを出す
-                    self.display_mode = "timer" # 通常のWi-Fiの場合はタイマー表示に戻す
-                    self.connected_time = now - timedelta(seconds=20)
-                    self.notified_targets.clear()
-                    self.suppress_notif = False  # 新接続時は必ず通知を有効化する
+                    with self._state_lock:
+                        self.display_mode = "timer" # 通常のWi-Fiの場合はタイマー表示に戻す
+                        self.connected_time = now - timedelta(seconds=20)
+                        self.notified_targets.clear()
+                        self.suppress_notif = False  # 新接続時は必ず通知を有効化する
                     
                     if was_sleeping and not ssid_changed:
                         time_str = self.connected_time.strftime("%H:%M")
-                        rumps.notification(
+                        self._queue_notification(
                             title="Wi-Fi Monitor",
                             subtitle="💤 スリープから復帰しました（5分以上経過）",
                             message=f"接続開始: {time_str} 〜 タイマーをリセットしました"
                         )
                     else:
-                        rumps.notification(
+                        self._queue_notification(
                             title="Wi-Fi Monitor",
                             subtitle="フリーWifiタイマーを起動しました",
                             message=f"接続先: {getattr(self, 'current_ssid', '不明')}"
@@ -505,11 +578,11 @@ class WiFiMonitorApp(rumps.App):
                                             if new_minutes:
                                                 self.target_minutes = sorted(list(set(new_minutes)))
                                         except Exception:
-                                            pass
+                                            logger.debug("タイマー入力値の解析に失敗", exc_info=True)
                                 else:
                                     self.target_minutes = []
                             except Exception:
-                                pass
+                                logger.debug("接続時タイマー設定ダイアログの表示に失敗", exc_info=True)
 
                         # タイマー処理をブロックしないように別スレッドでポップアップ表示
                         threading.Thread(target=prompt_timer_setup, daemon=True).start()
@@ -519,8 +592,9 @@ class WiFiMonitorApp(rumps.App):
         else:
             # 【オンライン -> オフライン】に切り替わった瞬間
             if self.is_online:
-                self.is_online = False
-                self.disconnected_time = now  # 切断した時刻を記録
+                with self._state_lock:
+                    self.is_online = False
+                    self.disconnected_time = now  # 切断した時刻を記録
                 
                 # 接続していた時間を計算
                 if self.connected_time:
@@ -535,7 +609,7 @@ class WiFiMonitorApp(rumps.App):
                 else:
                     msg = "通信が切断されました。"
                 
-                rumps.notification(
+                self._queue_notification(
                     title="Wi-Fi Monitor: ❌切断",
                     subtitle="インターネット接続が失われました",
                     message=msg
@@ -549,6 +623,17 @@ class WiFiMonitorApp(rumps.App):
 
     @rumps.timer(1) # 1秒ごとに表示更新
     def update_display(self, _):
+        # P2: ワーカースレッドから積まれた通知を、メインスレッドであるここで安全に発火する
+        if getattr(self, "_pending_notifications", None):
+            with self._notif_lock:
+                pending = self._pending_notifications
+                self._pending_notifications = []
+            for _t, _s, _m in pending:
+                try:
+                    rumps.notification(title=_t, subtitle=_s, message=_m)
+                except Exception:
+                    logger.debug("キュー済み通知の発火に失敗", exc_info=True)
+
         # メニューの一番上のSSID表示を更新（軽量化のため変更がある場合のみ）
         if getattr(self, "is_online", False):
             ssid_name = getattr(self, "current_ssid", None) or "取得中..."
@@ -694,13 +779,15 @@ class WiFiMonitorApp(rumps.App):
                 final_target = active_targets[-1]
                 # この更新タイミングで「新たに」到達した目標時間を集める。
                 # 設定変更直後など、既に複数の目標を過ぎている場合はここが複数件になる。
-                newly_passed = [t for t in active_targets if elapsed_minutes >= t and t not in self.notified_targets]
-                if newly_passed:
+                # P5: ワーカースレッドの notified_targets.clear() と競合しないよう、
+                # 「未通知の抽出」と「通知済み記録」をロック下で不可分に行う。
+                with self._state_lock:
+                    newly_passed = [t for t in active_targets if elapsed_minutes >= t and t not in self.notified_targets]
                     # 到達した目標はすべて通知済みとして記録する。
                     # （複数を個別に通知するとmacOSが連投を取りこぼすため、まとめて1回だけ通知する）
                     for t in newly_passed:
                         self.notified_targets.add(t)
-
+                if newly_passed:
                     highest = max(newly_passed)
                     if highest >= final_target:
                         # 最終目標に到達 → スライドではなくポップアップで強く警告
@@ -729,9 +816,10 @@ class WiFiMonitorApp(rumps.App):
             
             # オフラインになってから5分(300秒)以上経過したらカウントを完全にリセットする
             if self.disconnected_time and (datetime.now() - self.disconnected_time).total_seconds() > 300:
-                self.connected_time = None
-                self.disconnected_time = None
-                self.notified_targets.clear()
+                with self._state_lock:
+                    self.connected_time = None
+                    self.disconnected_time = None
+                    self.notified_targets.clear()
                 
             if not getattr(self, "first_check_done", False):
                 if self.display_mode == "custom_timer" and _custom_rem_str:
@@ -763,7 +851,7 @@ class WiFiMonitorApp(rumps.App):
             rumps.notification(**kwargs)  # type: ignore[arg-type]
             return
         except Exception:
-            pass
+            logger.debug("rumps通知に失敗。osascriptで再試行する", exc_info=True)
         # フォールバック: osascript の display notification（rumps が使えない/失敗した場合）
         try:
             t = self.escape_for_applescript(title)
@@ -772,7 +860,7 @@ class WiFiMonitorApp(rumps.App):
             script = f'display notification "{m}" with title "{t}" subtitle "{s}"'
             threading.Thread(target=lambda: subprocess.run(["osascript", "-e", script]), daemon=True).start()
         except Exception:
-            pass
+            logger.debug("osascriptによる通知フォールバックにも失敗", exc_info=True)
 
     def manage_safe_wifi(self, _):
         """ 非通知（タイマー対象外）Wi-Fiの一覧表示・登録・解除をまとめて行うポップアップ """
@@ -1209,9 +1297,9 @@ class WiFiMonitorApp(rumps.App):
         """ メニューからMacの標準Wi-Fi設定画面を開く """
         try:
             # macOSのシステム設定（Wi-Fi画面）を呼び出すコマンド
-            subprocess.run(["open", "x-apple.systempreferences:com.apple.wifi-settings-extension"])
+            subprocess.run(["open", "x-apple.systempreferences:com.apple.wifi-settings-extension"], timeout=5)
         except Exception:
-            pass
+            logger.debug("Wi-Fi設定画面の起動に失敗", exc_info=True)
 
     def _update_vpn_menu_visibility(self):
         """ VPN機能のON/OFFに応じて「VPN接続」表示欄の表示・非表示を切り替える """
@@ -1219,12 +1307,13 @@ class WiFiMonitorApp(rumps.App):
         try:
             self.vpn_status_menu._menuitem.setHidden_(not enabled)
         except Exception:
-            pass
+            logger.debug("VPN表示欄の表示・非表示切替に失敗", exc_info=True)
         if not enabled:
             # OFFにしたら状態をリセットして次回ON時に再取得させる
             self.vpn_connected = False
             self.vpn_name = None
             self._last_vpn_state = None
+            self._last_vpn_fetch = None  # P4: throttleもリセットし、次回ON時に即取得させる
 
     def open_settings(self, _):
         """ 「⚙️ 設定」メニュー：VPN機能の追加をON/OFFする """
@@ -1251,8 +1340,9 @@ class WiFiMonitorApp(rumps.App):
                 # 即時にVPN状態を取得して表示へ反映する
                 try:
                     self.vpn_connected, self.vpn_name = self.get_vpn_status()
+                    self._last_vpn_fetch = datetime.now()  # P4: 直後の重複取得を避ける
                 except Exception:
-                    pass
+                    logger.debug("VPN機能ON時の即時VPN取得に失敗", exc_info=True)
                 self._last_vpn_state = None
                 self.update_display(None)
             rumps.notification("Wi-Fi Monitor", "VPN機能をONにしました", "メニューに「VPN接続」欄を追加しました")
@@ -1267,9 +1357,9 @@ class WiFiMonitorApp(rumps.App):
     def open_vpn_settings(self, _):
         """ 「VPN接続」欄クリックでMacのVPN/ネットワーク設定画面を開く """
         try:
-            subprocess.run(["open", "x-apple.systempreferences:com.apple.preferences.network"])
+            subprocess.run(["open", "x-apple.systempreferences:com.apple.preferences.network"], timeout=5)
         except Exception:
-            pass
+            logger.debug("VPN/ネットワーク設定画面の起動に失敗", exc_info=True)
 
 if __name__ == "__main__":
     print("🔄 WiFi Monitorを起動しています...（終了するには Ctrl+C を押してください）")
