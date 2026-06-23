@@ -510,9 +510,9 @@ class WiFiMonitorApp(rumps.App):
                     is_safe = (self.current_ssid in getattr(self, "safe_ssids", [])) if self.current_ssid else False
                     self.is_safe_wifi = is_safe
                 
-                # 前回切断時から5分(300秒)以内の復帰かどうかを確認
+                # 前回切断時から15分(900秒)以内の復帰かどうかを確認
                 offline_seconds = (now - self.disconnected_time).total_seconds() if self.disconnected_time else 9999
-                is_within_5min = offline_seconds <= 300
+                is_within_15min = offline_seconds <= 900
                 was_sleeping = time_since_last_check >= 30
                 
                 if is_safe:
@@ -526,15 +526,11 @@ class WiFiMonitorApp(rumps.App):
                         subtitle=f"🏠 安全なWi-Fiに接続: {self.current_ssid}",
                         message="接続タイマーは動作しません。"
                     )
-                elif not ssid_changed and is_within_5min and was_sleeping:
-                    # 5分以内の離席（同一Wi-Fi）復帰 → タイマーを継続する
-                    self._queue_notification(
-                        title="Wi-Fi Monitor",
-                        subtitle="💤 スリープから復帰しました",
-                        message="前回のタイマーを継続します"
-                    )
+                elif not ssid_changed and is_within_15min and was_sleeping:
+                    # 15分以内の離席（同一Wi-Fi）復帰 → タイマーを継続する（通知は廃止）
+                    pass
                 else:
-                    # 新規接続・ネットワーク変更・5分以上経過 → リセットして通知設定ポップアップを出す
+                    # 新規接続・ネットワーク変更・15分以上経過 → リセットして通知設定ポップアップを出す
                     with self._state_lock:
                         self.display_mode = "timer" # 通常のWi-Fiの場合はタイマー表示に戻す
                         self.connected_time = now - timedelta(seconds=20)
@@ -542,11 +538,10 @@ class WiFiMonitorApp(rumps.App):
                         self.suppress_notif = False  # 新接続時は必ず通知を有効化する
                     
                     if was_sleeping and not ssid_changed:
-                        time_str = self.connected_time.strftime("%H:%M")
                         self._queue_notification(
                             title="Wi-Fi Monitor",
-                            subtitle="💤 スリープから復帰しました（5分以上経過）",
-                            message=f"接続開始: {time_str} 〜 タイマーをリセットしました"
+                            subtitle="💤 スリープから復帰しました（切断から15分以上経過）",
+                            message="アラームをリセットしました"
                         )
                     else:
                         self._queue_notification(
@@ -562,7 +557,7 @@ class WiFiMonitorApp(rumps.App):
                             osascript_cmd = f'''
                             tell application "System Events"
                                 activate
-                                set dialogResult to display dialog "未登録のWi-Fi ({ssid_disp}) に接続しました。\\n何分後に通知タイマーをスタートしますか？\\n※複数設定はカンマ区切り\\n※キャンセルで通知をオフにします" default answer "50, 55" buttons {{"キャンセル", "スタート"}} default button "スタート" cancel button "キャンセル" with title "Wi-Fi Monitor"
+                                set dialogResult to display dialog "未登録のWi-Fi ({ssid_disp}) に接続しました。\\n何分後に通知アラームをセットしますか？\\n※複数設定はカンマ区切り\\n※キャンセルで通知をオフにします" default answer "50, 55" buttons {{"キャンセル", "スタート"}} default button "スタート" cancel button "キャンセル" with title "Wi-Fi Monitor"
                                 return text returned of dialogResult
                             end tell
                             '''
@@ -603,9 +598,9 @@ class WiFiMonitorApp(rumps.App):
                     elapsed_seconds = total_seconds % 60
                     
                     if elapsed_minutes == 0:
-                        msg = "通信が切断されました。\n※そのままMacをスリープした場合、5分以内の復帰で引き継ぎます。"
+                        msg = "通信が切断されました。\n※そのままMacをスリープした場合、15分以内の復帰で引き継ぎます。"
                     else:
-                        msg = f"通信が切断されました。（接続時間: {elapsed_minutes}分{elapsed_seconds:02d}秒）\n※そのままMacをスリープした場合、5分以内の復帰で引き継ぎます。"
+                        msg = f"通信が切断されました。（接続時間: {elapsed_minutes}分{elapsed_seconds:02d}秒）\n※そのままMacをスリープした場合、15分以内の復帰で引き継ぎます。"
                 else:
                     msg = "通信が切断されました。"
                 
@@ -615,7 +610,7 @@ class WiFiMonitorApp(rumps.App):
                     message=msg
                 )
                 
-                # ※ここでは self.connected_time は None にしません（5分間の保留期間に入るため）
+                # ※ここでは self.connected_time は None にしません（15分間の保留期間に入るため）
                 
         # 初回の通信チェックが完了したことを記録
         if not getattr(self, "first_check_done", False):
@@ -814,8 +809,8 @@ class WiFiMonitorApp(rumps.App):
         else:
             # オフライン時の表示
             
-            # オフラインになってから5分(300秒)以上経過したらカウントを完全にリセットする
-            if self.disconnected_time and (datetime.now() - self.disconnected_time).total_seconds() > 300:
+            # オフラインになってから15分(900秒)以上経過したらカウントを完全にリセットする
+            if self.disconnected_time and (datetime.now() - self.disconnected_time).total_seconds() > 900:
                 with self._state_lock:
                     self.connected_time = None
                     self.disconnected_time = None
