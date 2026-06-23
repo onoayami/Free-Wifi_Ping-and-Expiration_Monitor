@@ -239,6 +239,25 @@ class WiFiMonitorApp(rumps.App):
         except Exception:
             return "🔴 Error"
 
+    @rumps.timer(2)  # 2秒ごとにPing速度を取得（ping -c1のみの軽い処理）
+    def update_ping(self, _):
+        # Ping表示モードかつオンライン時のみ取得して負荷を最小化する
+        if self.display_mode != "ping" or not getattr(self, "is_online", False):
+            return
+        if getattr(self, "checking_ping", False):
+            return
+        self.checking_ping = True
+        # pingはmacOSの-tタイムアウトで最大1秒ブロックするため、UIを止めないよう別スレッドで実行
+        threading.Thread(target=self._async_update_ping, daemon=True).start()
+
+    def _async_update_ping(self):
+        try:
+            self.cached_ping_display = self.get_ping_status()
+        except Exception:
+            pass
+        finally:
+            self.checking_ping = False
+
     @rumps.timer(5) # 5秒ごとに通信チェック
     def check_network(self, _):
         if getattr(self, "checking_network", False):
@@ -279,9 +298,9 @@ class WiFiMonitorApp(rumps.App):
             else:
                 current_status = False
 
-        if self.display_mode == "ping" and current_status:
-            self.cached_ping_display = self.get_ping_status()
-        else:
+        # Ping速度の取得は専用タイマー(update_ping/2秒間隔)が担当する。
+        # ここではオフライン時や非Ping表示時にキャッシュをクリアするだけにする。
+        if not (self.display_mode == "ping" and current_status):
             self.cached_ping_display = ""
 
         if current_status:
@@ -503,6 +522,8 @@ class WiFiMonitorApp(rumps.App):
             if self.timer_setting_menu.title != "⏱️タイマーの設定":
                 self.timer_setting_menu.title = "⏱️タイマーの設定"
 
+        # メニューバー表示は一旦 new_title に組み立て、最後に「前フレームから変化がある時」のみ書き換える
+        new_title = self.title
         if self.is_online and self.connected_time:
             now = datetime.now()
             total_seconds = int((now - self.connected_time).total_seconds())
@@ -520,11 +541,11 @@ class WiFiMonitorApp(rumps.App):
             
             _icon = "🏠" if getattr(self, "is_safe_wifi", False) else "🌐"
             if self.display_mode == "timer":
-                self.title = f"{_icon} {time_str}"
+                new_title = f"{_icon} {time_str}"
             elif self.display_mode == "custom_timer" and _custom_rem_str:
-                self.title = _custom_rem_str
+                new_title = _custom_rem_str
             else:
-                self.title = self.cached_ping_display
+                new_title = self.cached_ping_display
                 
             # 目標時間経過していて、まだ通知していなければ（かつ通知オフ設定でなければ）アラート
             if not self.suppress_notif and active_targets:
@@ -572,18 +593,22 @@ class WiFiMonitorApp(rumps.App):
                 
             if not getattr(self, "first_check_done", False):
                 if self.display_mode == "custom_timer" and _custom_rem_str:
-                    self.title = _custom_rem_str
+                    new_title = _custom_rem_str
                 elif self.display_mode == "timer":
-                    self.title = "🌀"
+                    new_title = "🌀"
                 else:
-                    self.title = "🌀 起動中..."
+                    new_title = "🌀 起動中..."
             else:
                 if self.display_mode == "custom_timer" and _custom_rem_str:
-                    self.title = _custom_rem_str
+                    new_title = _custom_rem_str
                 elif self.display_mode == "timer":
-                    self.title = "🔴"
+                    new_title = "🔴"
                 else:
-                    self.title = "🔴 オフライン"
+                    new_title = "🔴 オフライン"
+
+        # 前フレームから表示内容が変わった時だけメニューバーを書き換える（不要な再描画を避ける）
+        if self.title != new_title:
+            self.title = new_title
 
     def _safe_notification(self, title, subtitle, message, action=None):
         """ スライド通知を確実に表示する。
@@ -890,7 +915,7 @@ class WiFiMonitorApp(rumps.App):
         """ メニューバー表示を「ネット速度(Ping)」に切り替える """
         self.display_mode = "ping"
         self._last_alarm_state = None  # キャッシュをリセットして強制的に再描画させる
-        self.check_network(None)  # Ping状態を即時取得
+        self.update_ping(None)  # Ping速度を即時取得（2秒タイマーを待たずに反映）
         self.update_display(None) # 表示を即時更新
 
     def show_timer_mode(self, _):
