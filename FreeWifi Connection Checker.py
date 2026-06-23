@@ -89,7 +89,7 @@ class WiFiMonitorApp(rumps.App):
         self.menu.add(self.vpn_status_menu)
 
         # 3. アラーム設定状態表示（クリックでON/OFFを切り替える）
-        self.alarm_status_menu = rumps.MenuItem("⌛️ アラーム設定：現在 取得中...", callback=self.toggle_alarm)
+        self.alarm_status_menu = rumps.MenuItem("⌛️ アラーム設定：読み込み中...", callback=self.toggle_alarm)
         self.menu.add(self.alarm_status_menu)
 
         # 4. 非通知Wi-Fiの設定
@@ -102,20 +102,17 @@ class WiFiMonitorApp(rumps.App):
         self.timer_setting_menu = rumps.MenuItem("⏱️ タイマー機能", callback=self.open_timer_setting_popup)
         self.menu.add(self.timer_setting_menu)
 
-        self.menu.add(rumps.separator)
-
         # 7. 設定（VPN機能の有効化など）— Quitの上に配置
         self.settings_menu = rumps.MenuItem("⚙️ その他")
 
         # 接続時間のリセットを設定メニュー内に移動（VPN設定の上）
-        self.reset_timer_menu = rumps.MenuItem("🔄 ネット接続時間のリセット", callback=self._reset_timer)
+        self.reset_timer_menu = rumps.MenuItem("⏳ ネット接続時間のリセット", callback=self._reset_timer)
         self.settings_menu.add(self.reset_timer_menu)
 
-        self.vpn_settings_item = rumps.MenuItem("🔐 VPN設定", callback=self.open_settings)
+        self.vpn_settings_item = rumps.MenuItem("🔐 VPN接続 表示設定", callback=self.open_settings)
         self.settings_menu.add(self.vpn_settings_item)
         self.menu.add(self.settings_menu)
 
-        self.menu.add(rumps.separator)
         # この後ろに rumps が自動で Quit ボタンを追加する
 
         # VPN機能の有効/無効に応じてVPN表示欄の表示状態を初期化する
@@ -285,10 +282,44 @@ class WiFiMonitorApp(rumps.App):
         except Exception:
             return "🔴 Error"
 
+    def _detect_vpn_service_name(self):
+        """ 起動中のプロセス名から、接続しているVPNサービス名を推定する。
+        utun方式のアプリ(NordVPN/Surfshark/WireGuard等)は中身から判別できないため、
+        実行中のVPNクライアントのプロセス名で実サービス名を特定する。 """
+        try:
+            result = subprocess.run(["ps", "-axo", "comm="], capture_output=True, text=True, timeout=3)
+            text = result.stdout.lower() if result.returncode == 0 else ""
+        except Exception:
+            text = ""
+        # (検索キーワード, 表示名) の対応表。上から順にマッチした最初のものを採用
+        known = [
+            ("nordvpn", "NordVPN"),
+            ("expressvpn", "ExpressVPN"),
+            ("surfshark", "Surfshark"),
+            ("protonvpn", "Proton VPN"),
+            ("mullvad", "Mullvad VPN"),
+            ("cloudflarewarp", "Cloudflare WARP"),
+            ("warp-svc", "Cloudflare WARP"),
+            ("tunnelblick", "Tunnelblick (OpenVPN)"),
+            ("openvpn", "OpenVPN"),
+            ("wireguard", "WireGuard"),
+            ("tailscale", "Tailscale"),
+            ("anyconnect", "Cisco AnyConnect"),
+            ("vpnagentd", "Cisco AnyConnect"),
+            ("piavpn", "Private Internet Access"),
+            ("private internet access", "Private Internet Access"),
+            ("windscribe", "Windscribe"),
+            ("cyberghost", "CyberGhost"),
+        ]
+        for kw, disp in known:
+            if kw in text:
+                return disp
+        return None
+
     def get_vpn_status(self):
         """ VPNの接続状態を取得する。
         1. macOS標準 (scutil)
-        2. OpenVPNなどのサードパーティ製アプリ (ifconfig の utun / tun インターフェース) """
+        2. サードパーティ製アプリ (ifconfig の utun / tun インターフェース) """
         try:
             # 1. macOSの標準ネットワーク設定 (IKEv2, L2TPなど)
             result = subprocess.run(["scutil", "--nc", "list"], capture_output=True, text=True, timeout=3)
@@ -298,7 +329,7 @@ class WiFiMonitorApp(rumps.App):
                         m = re.search(r'"([^"]+)"', line)
                         return True, (m.group(1) if m else "システムVPN")
                         
-            # 2. OpenVPN, Tunnelblick, Tailscale 等 (utun, tun インターフェース)
+            # 2. NordVPN / Surfshark / WireGuard / Proton 等 (utun, tun インターフェース)
             # ifconfig の出力から、物理ネットワークとは別に作られるトンネル(utunX等)で、
             # 現在 UP かつ IPv4 が割り当てられているものを探す
             result2 = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=3)
@@ -322,7 +353,9 @@ class WiFiMonitorApp(rumps.App):
                             # (ローカルループバック 127.x.x.x は除外)
                             m_ip = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', line)
                             if m_ip and not m_ip.group(1).startswith("127."):
-                                return True, f"OpenVPN"
+                                # 実行中プロセスからサービス名を推定。不明ならインターフェース名で代用
+                                service = self._detect_vpn_service_name()
+                                return True, (service if service else f"VPN ({current_if})")
         except Exception:
             pass
         return False, None
@@ -557,10 +590,16 @@ class WiFiMonitorApp(rumps.App):
             self.countdown_display_menu.title = countdown_title
 
         # アラーム設定状態メニューの更新（軽量化のため状態が変わった場合のみ再描画）
-        alarm_state = (getattr(self, "is_safe_wifi", False), self.suppress_notif, tuple(self.target_minutes))
+        if not getattr(self, "first_check_done", False):
+            alarm_state = "loading"
+        else:
+            alarm_state = (getattr(self, "is_safe_wifi", False), self.suppress_notif, tuple(self.target_minutes))
+            
         if getattr(self, "_last_alarm_state", None) != alarm_state:
             self._last_alarm_state = alarm_state
-            if alarm_state[0]:
+            if alarm_state == "loading":
+                self.alarm_status_menu.title = "⌛️ アラーム設定：読み込み中..."
+            elif alarm_state[0]:
                 self.alarm_status_menu.title = "⌛️ アラーム設定：現在 OFF（非通知Wi-Fi）"
             elif alarm_state[1]:
                 self.alarm_status_menu.title = "⌛️ アラーム設定：現在 OFF（通知無効化）"
@@ -603,7 +642,7 @@ class WiFiMonitorApp(rumps.App):
                 self.is_custom_timer_alert_showing = True
                 past_minutes = getattr(self, "custom_timer_duration_minutes", 0)
                 self.custom_timer_end_time = None
-                self.timer_setting_menu.title = "⏱️タイマーの設定"
+                self.timer_setting_menu.title = "⏱️ タイマー機能"
                 
                 # モーダルポップアップの作成
                 alert = AppKit.NSAlert.alloc().init()
@@ -620,10 +659,10 @@ class WiFiMonitorApp(rumps.App):
                     self.custom_timer_end_time = datetime.now() + timedelta(minutes=past_minutes)
                     self.display_mode = "custom_timer"  # カウントダウン表示に戻す
                 else:
-                    self.timer_setting_menu.title = "⏱️タイマーの設定"
+                    self.timer_setting_menu.title = "⏱️ タイマー機能"
         else:
-            if self.timer_setting_menu.title != "⏱️タイマーの設定":
-                self.timer_setting_menu.title = "⏱️タイマーの設定"
+            if self.timer_setting_menu.title != "⏱️ タイマー機能":
+                self.timer_setting_menu.title = "⏱️ タイマー機能"
 
         # メニューバー表示は一旦 new_title に組み立て、最後に「前フレームから変化がある時」のみ書き換える
         new_title = self.title
@@ -1191,10 +1230,10 @@ class WiFiMonitorApp(rumps.App):
         """ 「⚙️ 設定」メニュー：VPN機能の追加をON/OFFする """
         current = "ON" if getattr(self, "vpn_feature_enabled", False) else "OFF"
         response = rumps.alert(
-            title="⚙️ 設定",
+            title="🔐 VPN接続 表示設定",
             message=(
-                f"【VPN機能の追加：現在 {current}】\n\n"
-                "ONにすると、メニューの「アラーム設定」の下に\n"
+                f"【VPN接続表示：現在 {current}】\n\n"
+                "ONにすると\nメニューの「アラーム設定」の下に\n"
                 "「VPN接続」の状態表示欄が追加され、\n"
                 "VPNに接続中かどうかが一目で分かります。"
             ),
